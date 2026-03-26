@@ -1,0 +1,107 @@
+{
+    "name": "sr3_mrsi_64",
+    "phase": "train",
+    "gpu_ids": [
+        0
+    ],
+    "path": {
+        "log": "logs",
+        "tb_logger": "tb_logger",
+        "results": "results",
+        "checkpoint": "checkpoint",
+        "resume_state": null
+    },
+    "datasets": {
+        "train": {
+            "name": "MRSI_train",
+            "mode": "MRSI_SR3",
+            "dataroot": "dataset_mrsi/mrsi_sr3_64/train",
+            "datatype": "npz",
+            "l_resolution": 64,
+            "r_resolution": 64,
+            "batch_size": 16,
+            "num_workers": 8,
+            "use_shuffle": true,
+            "data_len": -1,
+            "hflip": true,
+            "vflip": false
+        },
+        "val": {
+            "name": "MRSI_val",
+            "mode": "MRSI_SR3",
+            "dataroot": "dataset_mrsi/mrsi_sr3_64/val",
+            "datatype": "npz",
+            "l_resolution": 64,
+            "r_resolution": 64,
+            "data_len": -1,
+            "hflip": false,
+            "vflip": false
+        }
+    },
+    "model": {
+        "which_model_G": "sr3",
+        "finetune_norm": false,
+        "unet": {
+            "in_channel": 8,
+            "out_channel": 1,
+            "inner_channel": 64,
+            "channel_multiplier": [
+                1,
+                2,
+                4,
+                8
+            ],
+            "attn_res": [
+                16
+            ],
+            "res_blocks": 2,
+            "dropout": 0.1
+        },
+        "beta_schedule": {
+            "train": {
+                "schedule": "linear",
+                "n_timestep": 1000,
+                "linear_start": 1e-6,
+                "linear_end": 1e-2
+            },
+            "val": {
+                "schedule": "linear",
+                "n_timestep": 1000,
+                "linear_start": 1e-6,
+                "linear_end": 1e-2
+            }
+        },
+        "diffusion": {
+            "image_size": 64,
+            "channels": 1,
+            "conditional": true
+        }
+    },
+    "metrics": {
+        "enable_lpips": true,
+        "lpips_net": "alex",
+        "enable_frc": true,
+        "frc_apodize": true
+    },
+    "train": {
+        "n_iter": 300000,
+        "val_freq": 2000,
+        "save_checkpoint_freq": 5000,
+        "print_freq": 100,
+        "val_max_samples": -1,
+        "optimizer": {
+            "type": "adam",
+            "lr": 1e-4
+        },
+        "ema_scheduler": {
+            "step_start_ema": 5000,
+            "update_ema_every": 1,
+            "ema_decay": 0.9999
+        }
+    },
+    "wandb": {
+        "project": "sr3_mrsi"
+    }
+}
+
+

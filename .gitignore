@@ -130,3 +130,23 @@ dmypy.json
 .pyre/
 
 *.lmdb
+
+# IDE and local settings
+.cursor/
+.vscode/
+
+# Large experiment outputs
+experiments/*
+!experiments/*/config.json
+!experiments/*/graph/
+
+# MRSI data (large)
+dataset_mrsi/mrsi_sr3_*/**/*.nii
+dataset_mrsi/mrsi_sr3_*/**/*.npy
+dataset_mrsi/*/run_config.json
+!dataset_mrsi/mrsi_sr3_64_smoke/
+
+# Windows specific
+*.bat
+*.ps1
+
