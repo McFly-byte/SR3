@@ -1,8 +1,10 @@
 {
-    "name": "sr3_mrsi_64",
+    "name": "sr3_mrsi_64_phase2",
     "phase": "train",
     "gpu_ids": [
-        0
+        0,
+        1,
+        2
     ],
     "path": {
         "log": "logs",
@@ -19,7 +21,7 @@
             "datatype": "npz",
             "l_resolution": 64,
             "r_resolution": 64,
-            "batch_size": 16,
+            "batch_size": 48,
             "num_workers": 8,
             "use_shuffle": true,
             "data_len": -1,
@@ -42,8 +44,8 @@
         "which_model_G": "sr3",
         "finetune_norm": false,
         "unet": {
-            "in_channel": 8,
-            "out_channel": 1,
+            "in_channel": 8,           // 7 cond channels + 1 noisy target
+            "out_channel": 1,          // single-channel metabolite
             "inner_channel": 64,
             "channel_multiplier": [
                 1,
@@ -56,7 +58,12 @@
                 32
             ],
             "res_blocks": 2,
-            "dropout": 0.1
+            "dropout": 0.1,
+            // T1 Cross-Attention: set t1_in_channel=1 to enable the T1Encoder + CrossAttentionBlock.
+            // t1_channel_idx (in diffusion section) must point to the T1 channel in the 7-ch condition.
+            // Condition layout: [lr(0), t1(1), flair(2), met_onehot(3,4,5,6)]
+            "t1_in_channel": 1,
+            "t1_cross_attn_res": [16, 32]  // apply cross-attn at these decoder resolutions
         },
         "beta_schedule": {
             "train": {
@@ -79,7 +86,8 @@
             "sampler_type": "ddim",
             "sample_num_steps": 50,
             "mask_loss_weight": 2.0,
-            "freq_loss_weight": 0.0
+            "freq_loss_weight": 0.1,    // FFT-L1 auxiliary loss weight (Phase 2 feature)
+            "t1_channel_idx": 1         // index of T1 within the 7-channel condition tensor
         }
     },
     "metrics": {
@@ -108,5 +116,3 @@
         "project": "sr3_mrsi"
     }
 }
-
-

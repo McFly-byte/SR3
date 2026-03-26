@@ -120,6 +120,8 @@ def define_G(opt):
             model_opt['unet']['in_channel'] = resolved_in_channel
         else:
             raise ValueError('model.unet.in_channel must be provided for non-MRSI datasets.')
+    t1_in_channel = model_opt['unet'].get('t1_in_channel', 0)
+    t1_cross_attn_res = model_opt['unet'].get('t1_cross_attn_res', None)
     model = unet.UNet(
         in_channel=model_opt['unet']['in_channel'],
         out_channel=model_opt['unet']['out_channel'],
@@ -129,7 +131,9 @@ def define_G(opt):
         attn_res=model_opt['unet']['attn_res'],
         res_blocks=model_opt['unet']['res_blocks'],
         dropout=model_opt['unet']['dropout'],
-        image_size=model_opt['diffusion']['image_size']
+        image_size=model_opt['diffusion']['image_size'],
+        t1_in_channel=t1_in_channel,
+        t1_cross_attn_res=t1_cross_attn_res,
     )
     netG = diffusion.GaussianDiffusion(
         model,
@@ -139,7 +143,10 @@ def define_G(opt):
         conditional=model_opt['diffusion']['conditional'],
         schedule_opt=model_opt['beta_schedule']['train'],
         sampler_type=model_opt['diffusion'].get('sampler_type', 'ddpm'),
-        sample_num_steps=model_opt['diffusion'].get('sample_num_steps')
+        sample_num_steps=model_opt['diffusion'].get('sample_num_steps'),
+        mask_loss_weight=model_opt['diffusion'].get('mask_loss_weight', 2.0),
+        freq_loss_weight=model_opt['diffusion'].get('freq_loss_weight', 0.0),
+        t1_channel_idx=model_opt['diffusion'].get('t1_channel_idx', -1),
     )
     if opt['phase'] == 'train':
         # init_weights(netG, init_type='kaiming', scale=0.1)

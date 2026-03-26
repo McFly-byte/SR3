@@ -142,6 +142,99 @@ class SelfAttention(nn.Module):
         return out + input
 
 
+class CrossAttentionBlock(nn.Module):
+    """Spatial cross-attention that injects T1 structural context into decoder features.
+
+    The query comes from the UNet decoder feature map; key/value come from the
+    T1 encoder feature map (spatially aligned via bilinear interpolation when
+    resolutions differ).  Uses a residual connection so the block is a no-op
+    when the T1 context is absent or zero-initialized.
+    """
+
+    def __init__(self, query_dim, context_dim, n_heads=4, norm_groups=32):
+        super().__init__()
+        # Clamp norm_groups so it always divides query_dim
+        norm_groups_q = min(norm_groups, query_dim)
+        while query_dim % norm_groups_q != 0 and norm_groups_q > 1:
+            norm_groups_q -= 1
+        norm_groups_ctx = min(norm_groups, context_dim)
+        while context_dim % norm_groups_ctx != 0 and norm_groups_ctx > 1:
+            norm_groups_ctx -= 1
+
+        self.norm_q = nn.GroupNorm(norm_groups_q, query_dim)
+        self.norm_ctx = nn.GroupNorm(norm_groups_ctx, context_dim)
+        # Project context to query space for K and V
+        self.to_q = nn.Conv2d(query_dim, query_dim, 1, bias=False)
+        self.to_k = nn.Conv2d(context_dim, query_dim, 1, bias=False)
+        self.to_v = nn.Conv2d(context_dim, query_dim, 1, bias=False)
+        self.out_proj = nn.Conv2d(query_dim, query_dim, 1)
+        self.n_heads = n_heads
+        # Zero-init output projection so the block starts as identity
+        nn.init.zeros_(self.out_proj.weight)
+        nn.init.zeros_(self.out_proj.bias)
+
+    def forward(self, x, context):
+        """
+        x:       (B, C_q, H, W)  decoder feature
+        context: (B, C_ctx, H', W')  T1 encoder feature (any spatial size)
+        """
+        if context.shape[-2:] != x.shape[-2:]:
+            context = F.interpolate(context, size=x.shape[-2:], mode='bilinear', align_corners=False)
+
+        B, C, H, W = x.shape
+        n_heads = self.n_heads
+        head_dim = C // n_heads
+
+        q = self.to_q(self.norm_q(x))          # (B, C, H, W)
+        k = self.to_k(self.norm_ctx(context))  # (B, C, H, W)
+        v = self.to_v(context)                 # (B, C, H, W)
+
+        # Reshape to (B, heads, head_dim, H*W)
+        q = q.view(B, n_heads, head_dim, H * W)
+        k = k.view(B, n_heads, head_dim, H * W)
+        v = v.view(B, n_heads, head_dim, H * W)
+
+        # Attention: (B, heads, H*W, H*W)
+        scale = math.sqrt(head_dim)
+        attn = torch.einsum('bncd,bnce->bnde', q, k) / scale
+        attn = attn.softmax(dim=-1)
+
+        out = torch.einsum('bnde,bnce->bncd', attn, v)  # (B, heads, head_dim, H*W)
+        out = out.reshape(B, C, H, W)
+        return x + self.out_proj(out)
+
+
+class T1Encoder(nn.Module):
+    """Lightweight encoder that extracts multi-scale structural features from the T1 image.
+
+    The encoder produces a single feature map at the same spatial resolution as
+    the input.  Cross-attention blocks inside UNet up-/down-sample as needed.
+    Trained jointly with the diffusion model (no frozen weights).
+    """
+
+    def __init__(self, in_channels=1, out_channels=64, norm_groups=32):
+        super().__init__()
+        norm_groups_safe = min(norm_groups, out_channels)
+        while out_channels % norm_groups_safe != 0 and norm_groups_safe > 1:
+            norm_groups_safe -= 1
+
+        self.encoder = nn.Sequential(
+            nn.Conv2d(in_channels, out_channels, 3, padding=1),
+            nn.GroupNorm(norm_groups_safe, out_channels),
+            Swish(),
+            nn.Conv2d(out_channels, out_channels, 3, padding=1),
+            nn.GroupNorm(norm_groups_safe, out_channels),
+            Swish(),
+            nn.Conv2d(out_channels, out_channels, 3, padding=1),
+        )
+        # Zero-init last layer so the encoder starts as a no-op
+        nn.init.zeros_(self.encoder[-1].weight)
+        nn.init.zeros_(self.encoder[-1].bias)
+
+    def forward(self, t1):
+        return self.encoder(t1)
+
+
 class ResnetBlocWithAttn(nn.Module):
     def __init__(self, dim, dim_out, *, noise_level_emb_dim=None, norm_groups=32, dropout=0, with_attn=False):
         super().__init__()
@@ -170,7 +263,10 @@ class UNet(nn.Module):
         res_blocks=3,
         dropout=0,
         with_noise_level_emb=True,
-        image_size=128
+        image_size=128,
+        # T1 cross-attention: set t1_in_channel > 0 to enable
+        t1_in_channel=0,
+        t1_cross_attn_res=None,  # list of resolutions where cross-attn is applied in decoder
     ):
         super().__init__()
 
@@ -214,7 +310,9 @@ class UNet(nn.Module):
                                dropout=dropout, with_attn=False)
         ])
 
+        # Track decoder resolutions for cross-attention placement
         ups = []
+        ups_res_track = []  # parallel list tracking resolution at each ups index
         for ind in reversed(range(num_mults)):
             is_last = (ind < 1)
             use_attn = (now_res in attn_res)
@@ -223,16 +321,72 @@ class UNet(nn.Module):
                 ups.append(ResnetBlocWithAttn(
                     pre_channel+feat_channels.pop(), channel_mult, noise_level_emb_dim=noise_level_channel, norm_groups=norm_groups,
                         dropout=dropout, with_attn=use_attn))
+                ups_res_track.append(now_res)
                 pre_channel = channel_mult
             if not is_last:
                 ups.append(Upsample(pre_channel))
+                ups_res_track.append(now_res)
                 now_res = now_res*2
 
         self.ups = nn.ModuleList(ups)
 
         self.final_conv = Block(pre_channel, default(out_channel, in_channel), groups=norm_groups)
 
-    def forward(self, x, time):
+        # T1 Cross-Attention setup
+        self.use_t1_cross_attn = t1_in_channel > 0
+        self._cross_attn_idx = {}  # always defined; populated below if enabled
+        if self.use_t1_cross_attn:
+            t1_feat_dim = inner_channel
+            self.t1_encoder = T1Encoder(
+                in_channels=t1_in_channel,
+                out_channels=t1_feat_dim,
+                norm_groups=norm_groups,
+            )
+            # Determine which decoder positions get cross-attention
+            if t1_cross_attn_res is None:
+                # Default: apply at the same resolutions as self-attention
+                t1_cross_attn_res = list(attn_res) if hasattr(attn_res, '__iter__') else [attn_res]
+            t1_cross_attn_res_set = set(t1_cross_attn_res)
+
+            cross_attn_modules = []
+            for i, layer in enumerate(self.ups):
+                if isinstance(layer, ResnetBlocWithAttn):
+                    res_at_layer = ups_res_track[i]
+                    if res_at_layer in t1_cross_attn_res_set:
+                        # Derive output channel dim from the resnet block's second conv
+                        out_ch = layer.res_block.block2.block[-1].out_channels
+                        cross_attn_modules.append(
+                            CrossAttentionBlock(
+                                query_dim=out_ch,
+                                context_dim=t1_feat_dim,
+                                n_heads=max(1, out_ch // 64),
+                                norm_groups=norm_groups,
+                            )
+                        )
+                    else:
+                        cross_attn_modules.append(None)
+                else:
+                    cross_attn_modules.append(None)
+
+            # Store as ModuleList (skip None entries, keep index mapping)
+            self.cross_attn_modules = nn.ModuleList(
+                [m for m in cross_attn_modules if m is not None]
+            )
+            # Build index: ups_index -> cross_attn_modules index
+            ca_idx = 0
+            for i, m in enumerate(cross_attn_modules):
+                if m is not None:
+                    self._cross_attn_idx[i] = ca_idx
+                    ca_idx += 1
+
+    def forward(self, x, time, t1_feat=None):
+        """
+        x:       concatenated [condition, x_noisy] tensor
+        time:    continuous sqrt_alpha_cumprod noise level (B, 1)
+        t1_feat: optional pre-computed T1 encoder features (B, C_t1, H, W).
+                 If None and self.use_t1_cross_attn is True, cross-attention
+                 is skipped (backward-compatible).
+        """
         t = self.noise_level_mlp(time) if exists(
             self.noise_level_mlp) else None
 
@@ -250,9 +404,13 @@ class UNet(nn.Module):
             else:
                 x = layer(x)
 
-        for layer in self.ups:
+        for i, layer in enumerate(self.ups):
             if isinstance(layer, ResnetBlocWithAttn):
                 x = layer(torch.cat((x, feats.pop()), dim=1), t)
+                # Apply T1 cross-attention if available at this layer
+                if t1_feat is not None and i in self._cross_attn_idx:
+                    ca_mod = self.cross_attn_modules[self._cross_attn_idx[i]]
+                    x = ca_mod(x, t1_feat)
             else:
                 x = layer(x)
 

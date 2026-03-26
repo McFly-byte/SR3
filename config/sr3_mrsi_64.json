@@ -54,20 +54,21 @@
                 8
             ],
             "attn_res": [
-                16
+                16,
+                32
             ],
             "res_blocks": 2,
             "dropout": 0.1
         },
         "beta_schedule": {
             "train": {
-                "schedule": "linear",
+                "schedule": "cosine", // changed from linear: smoother schedule, avoids sharp high-noise collapse
                 "n_timestep": 1000,
                 "linear_start": 1e-6,
                 "linear_end": 1e-2
             },
             "val": {
-                "schedule": "linear",
+                "schedule": "cosine",
                 "n_timestep": 1000,
                 "linear_start": 1e-6,
                 "linear_end": 1e-2
@@ -76,7 +77,11 @@
         "diffusion": {
             "image_size": 64,
             "channels": 1,
-            "conditional": true
+            "conditional": true,
+            "sampler_type": "ddim",       // use DDIM at inference for 20x speed-up
+            "sample_num_steps": 50,       // 50 DDIM steps; use 1000 for full DDPM
+            "mask_loss_weight": 2.0,      // ROI pixels receive 2x gradient weight
+            "freq_loss_weight": 0.0       // set >0 (e.g. 0.1) to enable FFT-L1 loss
         }
     },
     "metrics": {
