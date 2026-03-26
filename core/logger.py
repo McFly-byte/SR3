@@ -18,6 +18,28 @@ def get_timestamp():
     return datetime.now().strftime('%y%m%d_%H%M%S')
 
 
+def get_dist_info():
+    rank = int(os.environ.get('RANK', '0'))
+    world_size = int(os.environ.get('WORLD_SIZE', '1'))
+    local_rank = int(os.environ.get('LOCAL_RANK', '0'))
+    return rank, world_size, local_rank
+
+
+def is_main_process():
+    rank, _, _ = get_dist_info()
+    return rank == 0
+
+
+def _get_shared_run_suffix():
+    run_id = os.environ.get('TORCHELASTIC_RUN_ID')
+    if run_id and run_id != 'none':
+        return run_id.replace(':', '_')
+    master_port = os.environ.get('MASTER_PORT')
+    if master_port:
+        return f'ddp_{master_port}'
+    return get_timestamp()
+
+
 def parse(args):
     phase = args.phase
     opt_path = args.config
@@ -34,8 +56,10 @@ def parse(args):
     # set log directory
     if args.debug:
         opt['name'] = 'debug_{}'.format(opt['name'])
+    _, world_size, local_rank = get_dist_info()
+    run_suffix = _get_shared_run_suffix() if world_size > 1 else get_timestamp()
     experiments_root = os.path.join(
-        'experiments', '{}_{}'.format(opt['name'], get_timestamp()))
+        'experiments', '{}_{}'.format(opt['name'], run_suffix))
     opt['path']['experiments_root'] = experiments_root
     for key, path in opt['path'].items():
         if 'resume' not in key and 'experiments' not in key:
@@ -53,10 +77,12 @@ def parse(args):
         gpu_list = ','.join(str(x) for x in opt['gpu_ids'])
     os.environ['CUDA_VISIBLE_DEVICES'] = gpu_list
     print('export CUDA_VISIBLE_DEVICES=' + gpu_list)
-    if len(gpu_list) > 1:
-        opt['distributed'] = True
-    else:
-        opt['distributed'] = False
+    rank, world_size, local_rank = get_dist_info()
+    opt['rank'] = rank
+    opt['world_size'] = world_size
+    opt['local_rank'] = local_rank
+    opt['distributed'] = bool(world_size > 1)
+    opt['is_main_process'] = bool(rank == 0)
 
     # debug
     if 'debug' in opt['name']:
@@ -69,9 +95,8 @@ def parse(args):
         opt['datasets']['train']['data_len'] = 6
         opt['datasets']['val']['data_len'] = 3
 
-    # validation in train phase
-    if phase == 'train':
-        opt['datasets']['val']['data_len'] = 3
+    # keep full validation set in train phase by default
+    # (debug mode already overrides data_len above).
 
     # W&B Logging
     try:

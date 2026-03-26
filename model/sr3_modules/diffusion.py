@@ -69,7 +69,9 @@ class GaussianDiffusion(nn.Module):
         channels=3,
         loss_type='l1',
         conditional=True,
-        schedule_opt=None
+        schedule_opt=None,
+        sampler_type='ddpm',
+        sample_num_steps=None,
     ):
         super().__init__()
         self.channels = channels
@@ -77,6 +79,8 @@ class GaussianDiffusion(nn.Module):
         self.denoise_fn = denoise_fn
         self.loss_type = loss_type
         self.conditional = conditional
+        self.sampler_type = sampler_type
+        self.sample_num_steps = sample_num_steps
         if schedule_opt is not None:
             pass
             # self.set_new_noise_schedule(schedule_opt)
@@ -167,47 +171,73 @@ class GaussianDiffusion(nn.Module):
         return model_mean, posterior_log_variance
 
     @torch.no_grad()
-    def p_sample(self, x, t, clip_denoised=True, condition_x=None):
+    def p_sample(self, x, t, clip_denoised=True, condition_x=None, generator=None):
         model_mean, model_log_variance = self.p_mean_variance(
             x=x, t=t, clip_denoised=clip_denoised, condition_x=condition_x)
-        noise = torch.randn_like(x) if t > 0 else torch.zeros_like(x)
+        noise = torch.randn(
+            x.shape, device=x.device, dtype=x.dtype, generator=generator
+        ) if t > 0 else torch.zeros_like(x)
         return model_mean + noise * (0.5 * model_log_variance).exp()
 
     @torch.no_grad()
-    def p_sample_loop(self, x_in, continous=False):
+    def p_sample_loop(self, x_in, continous=False, seed=None, sample_num_steps=None):
         device = self.betas.device
         sample_inter = (1 | (self.num_timesteps//10))
+        sample_num_steps = int(sample_num_steps or self.sample_num_steps or self.num_timesteps)
+        if self.sampler_type != 'ddpm':
+            raise NotImplementedError(f"Unsupported sampler_type: {self.sampler_type}")
+        if sample_num_steps != self.num_timesteps:
+            raise NotImplementedError(
+                "Reduced-step sampling is not implemented for the current DDPM sampler yet."
+            )
+        generator = None
+        if seed is not None:
+            if device.type == 'cuda':
+                generator = torch.Generator(device=device)
+            else:
+                generator = torch.Generator()
+            generator.manual_seed(int(seed))
         if not self.conditional:
             shape = x_in
-            img = torch.randn(shape, device=device)
+            img = torch.randn(shape, device=device, generator=generator)
             ret_img = img
             for i in tqdm(reversed(range(0, self.num_timesteps)), desc='sampling loop time step', total=self.num_timesteps):
-                img = self.p_sample(img, i)
+                img = self.p_sample(img, i, generator=generator)
                 if i % sample_inter == 0:
                     ret_img = torch.cat([ret_img, img], dim=0)
         else:
             x = x_in
             shape = x.shape
-            img = torch.randn(shape, device=device)
-            ret_img = x
+            # Keep latent sample channels aligned with predicted target channels.
+            img = torch.randn(
+                (shape[0], self.channels, shape[2], shape[3]),
+                device=device,
+                generator=generator
+            )
+            ret_img = img
             for i in tqdm(reversed(range(0, self.num_timesteps)), desc='sampling loop time step', total=self.num_timesteps):
-                img = self.p_sample(img, i, condition_x=x)
+                img = self.p_sample(img, i, condition_x=x, generator=generator)
                 if i % sample_inter == 0:
                     ret_img = torch.cat([ret_img, img], dim=0)
         if continous:
             return ret_img
         else:
-            return ret_img[-1]
+            return img
 
     @torch.no_grad()
-    def sample(self, batch_size=1, continous=False):
+    def sample(self, batch_size=1, continous=False, seed=None, sample_num_steps=None):
         image_size = self.image_size
         channels = self.channels
-        return self.p_sample_loop((batch_size, channels, image_size, image_size), continous)
+        return self.p_sample_loop(
+            (batch_size, channels, image_size, image_size),
+            continous,
+            seed=seed,
+            sample_num_steps=sample_num_steps
+        )
 
     @torch.no_grad()
-    def super_resolution(self, x_in, continous=False):
-        return self.p_sample_loop(x_in, continous)
+    def super_resolution(self, x_in, continous=False, seed=None, sample_num_steps=None):
+        return self.p_sample_loop(x_in, continous, seed=seed, sample_num_steps=sample_num_steps)
 
     def q_sample(self, x_start, continuous_sqrt_alpha_cumprod, noise=None):
         noise = default(noise, lambda: torch.randn_like(x_start))

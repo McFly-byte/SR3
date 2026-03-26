@@ -9,6 +9,21 @@ from core.wandb_logger import WandbLogger
 from tensorboardX import SummaryWriter
 import os
 
+
+def _to_3ch_hwc(img_np):
+    if img_np.ndim == 2:
+        return img_np[:, :, None].repeat(3, axis=2)
+    if img_np.ndim == 3 and img_np.shape[2] == 1:
+        return img_np.repeat(3, axis=2)
+    if img_np.ndim == 3 and img_np.shape[2] >= 3:
+        return img_np[:, :, :3]
+    raise ValueError(f'Unsupported image shape: {img_np.shape}')
+
+
+def _concat_triplet(left, mid, right):
+    import numpy as np
+    return np.concatenate((_to_3ch_hwc(left), _to_3ch_hwc(mid), _to_3ch_hwc(right)), axis=1)
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument('-c', '--config', type=str, default='config/sr_sr3_64_512.json',
@@ -18,6 +33,7 @@ if __name__ == "__main__":
     parser.add_argument('-debug', '-d', action='store_true')
     parser.add_argument('-enable_wandb', action='store_true')
     parser.add_argument('-log_infer', action='store_true')
+    parser.add_argument('--eval_split', type=str, choices=['val', 'test'], default=None)
     
     # parse configs
     args = parser.parse_args()
@@ -42,12 +58,15 @@ if __name__ == "__main__":
     else:
         wandb_logger = None
 
-    # dataset
+    seed = int(opt.get('train', {}).get('seed', 0) or 0)
+    deterministic = bool(opt.get('train', {}).get('deterministic', False))
+    Logger.set_random_seed(seed, deterministic=deterministic)
+
+    eval_loaders = {}
     for phase, dataset_opt in opt['datasets'].items():
-        if phase == 'val':
-            val_set = Data.create_dataset(dataset_opt, phase)
-            val_loader = Data.create_dataloader(
-                val_set, dataset_opt, phase)
+        if phase in ['val', 'test']:
+            dataset = Data.create_dataset(dataset_opt, phase)
+            eval_loaders[phase] = Data.create_dataloader(dataset, dataset_opt, phase)
     logger.info('Initial Dataset Finished')
 
     # model
@@ -59,43 +78,45 @@ if __name__ == "__main__":
     
     logger.info('Begin Model Inference.')
     current_step = 0
-    current_epoch = 0
     idx = 0
+    validation_opt = opt.get('validation', {}) or {}
+    eval_split = args.eval_split or validation_opt.get('split', 'val')
+    val_loader = eval_loaders.get(eval_split)
+    if val_loader is None:
+        raise ValueError(f'Evaluation split [{eval_split}] is not configured.')
+    save_indices = validation_opt.get('save_image_indices')
+    if save_indices is None:
+        save_indices = list(range(int(validation_opt.get('save_image_count', 4) or 0)))
+    save_indices = set(int(v) for v in save_indices)
+    save_process = bool(validation_opt.get('save_process', False))
+    fixed_seed = validation_opt.get('fixed_seed')
+    sample_num_steps = validation_opt.get('sample_num_steps')
 
-    result_path = '{}'.format(opt['path']['results'])
+    result_path = os.path.join(opt['path']['results'], eval_split)
     os.makedirs(result_path, exist_ok=True)
-    for _,  val_data in enumerate(val_loader):
+    for sample_idx, val_data in enumerate(val_loader):
+        if save_indices and sample_idx not in save_indices:
+            continue
         idx += 1
         diffusion.feed_data(val_data)
-        diffusion.test(continous=True)
-        visuals = diffusion.get_current_visuals(need_LR=False)
+        sample_seed = None if fixed_seed is None else int(fixed_seed) + int(sample_idx)
+        diffusion.test(continous=True, seed=sample_seed, sample_num_steps=sample_num_steps)
+        visuals = diffusion.get_current_visuals(need_LR=True)
 
         hr_img = Metrics.tensor2img(visuals['HR'])  # uint8
-        fake_img = Metrics.tensor2img(visuals['INF'])  # uint8
+        lr_img = Metrics.tensor2img(visuals['LR'])  # uint8
 
-        sr_img_mode = 'grid'
-        if sr_img_mode == 'single':
-            # single img series
-            sr_img = visuals['SR']  # uint8
-            sample_num = sr_img.shape[0]
-            for iter in range(0, sample_num):
-                Metrics.save_img(
-                    Metrics.tensor2img(sr_img[iter]), '{}/{}_{}_sr_{}.png'.format(result_path, current_step, idx, iter))
-        else:
-            # grid img
-            sr_img = Metrics.tensor2img(visuals['SR'])  # uint8
+        sr_img = Metrics.tensor2img(visuals['SR'])  # uint8
+        Metrics.save_img(
+            _concat_triplet(lr_img, Metrics.tensor2img(visuals['SR'][-1]), hr_img),
+            '{}/{}_{}_vis.png'.format(result_path, current_step, idx)
+        )
+        if save_process:
             Metrics.save_img(
                 sr_img, '{}/{}_{}_sr_process.png'.format(result_path, current_step, idx))
-            Metrics.save_img(
-                Metrics.tensor2img(visuals['SR'][-1]), '{}/{}_{}_sr.png'.format(result_path, current_step, idx))
-
-        Metrics.save_img(
-            hr_img, '{}/{}_{}_hr.png'.format(result_path, current_step, idx))
-        Metrics.save_img(
-            fake_img, '{}/{}_{}_inf.png'.format(result_path, current_step, idx))
 
         if wandb_logger and opt['log_infer']:
-            wandb_logger.log_eval_data(fake_img, Metrics.tensor2img(visuals['SR'][-1]), hr_img)
+            wandb_logger.log_eval_data(lr_img, Metrics.tensor2img(visuals['SR'][-1]), hr_img)
 
     if wandb_logger and opt['log_infer']:
         wandb_logger.log_eval_table(commit=True)

@@ -212,13 +212,13 @@ class GaussianDiffusion(nn.Module):
                     (b,), i, device=device, dtype=torch.long))
                 if i % sample_inter == 0:
                     ret_img = torch.cat([ret_img, img], dim=0)
-            return img
         else:
             x = x_in
             shape = x.shape
             b = shape[0]
-            img = torch.randn(shape, device=device)
-            ret_img = x
+            # Keep latent sample channels aligned with predicted target channels.
+            img = torch.randn((shape[0], self.channels, shape[2], shape[3]), device=device)
+            ret_img = img
             for i in tqdm(reversed(range(0, self.num_timesteps)), desc='sampling loop time step', total=self.num_timesteps):
                 img = self.p_sample(img, torch.full(
                     (b,), i, device=device, dtype=torch.long), condition_x=x)
@@ -227,7 +227,7 @@ class GaussianDiffusion(nn.Module):
         if continous:
             return ret_img
         else:
-            return ret_img[-1]
+            return img
 
     @torch.no_grad()
     def sample(self, batch_size=1, continous=False):

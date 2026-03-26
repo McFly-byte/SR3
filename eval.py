@@ -1,41 +1,60 @@
 import argparse
-import core.metrics as Metrics
-from PIL import Image
+import csv
+import json
+import os
+from collections import defaultdict
+
 import numpy as np
-import glob
+
+
+def _safe_mean(vals):
+    if len(vals) == 0:
+        return 0.0
+    return float(np.mean(vals))
+
+
+def _summarize_rows(rows, group_key):
+    metric_keys = [k for k in rows[0].keys() if k not in {'index', 'patient_id', 'slice_idx', 'met_id', 'lowres'}]
+    grouped = defaultdict(list)
+    for row in rows:
+        grouped[str(row[group_key])].append(row)
+    out = {}
+    for key, items in grouped.items():
+        summary = {'count': len(items)}
+        for metric_key in metric_keys:
+            vals = [float(item[metric_key]) for item in items if item[metric_key] not in ('', 'None', None)]
+            summary[metric_key] = _safe_mean(vals)
+        out[key] = summary
+    return out
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument('-p', '--path', type=str,
-                        default='experiments/basic_sr_ffhq_210809_142238/results')
+    parser.add_argument('-p', '--path', type=str, required=True,
+                        help='Path to metrics.csv or result directory that contains metrics.csv.')
     args = parser.parse_args()
-    real_names = list(glob.glob('{}/*_hr.png'.format(args.path)))
-    fake_names = list(glob.glob('{}/*_sr.png'.format(args.path)))
 
-    real_names.sort()
-    fake_names.sort()
+    csv_path = args.path
+    if os.path.isdir(csv_path):
+        csv_path = os.path.join(csv_path, 'metrics.csv')
+    if not os.path.exists(csv_path):
+        raise FileNotFoundError(f'metrics.csv not found: {csv_path}')
 
-    avg_psnr = 0.0
-    avg_ssim = 0.0
-    idx = 0
-    for rname, fname in zip(real_names, fake_names):
-        idx += 1
-        ridx = rname.rsplit("_hr")[0]
-        fidx = rname.rsplit("_sr")[0]
-        assert ridx == fidx, 'Image ridx:{ridx}!=fidx:{fidx}'.format(
-            ridx, fidx)
+    with open(csv_path, 'r', encoding='utf-8') as f:
+        rows = list(csv.DictReader(f))
+    if len(rows) == 0:
+        raise ValueError('metrics.csv is empty.')
 
-        hr_img = np.array(Image.open(rname))
-        sr_img = np.array(Image.open(fname))
-        psnr = Metrics.calculate_psnr(sr_img, hr_img)
-        ssim = Metrics.calculate_ssim(sr_img, hr_img)
-        avg_psnr += psnr
-        avg_ssim += ssim
-        if idx % 20 == 0:
-            print('Image:{}, PSNR:{:.4f}, SSIM:{:.4f}'.format(idx, psnr, ssim))
+    metric_keys = [k for k in rows[0].keys() if k not in {'index', 'patient_id', 'slice_idx', 'met_id', 'lowres'}]
+    overall = {'count': len(rows)}
+    for metric_key in metric_keys:
+        vals = [float(item[metric_key]) for item in rows if item[metric_key] not in ('', 'None', None)]
+        overall[metric_key] = _safe_mean(vals)
 
-    avg_psnr = avg_psnr / idx
-    avg_ssim = avg_ssim / idx
-
-    # log
-    print('# Validation # PSNR: {:.4e}'.format(avg_psnr))
-    print('# Validation # SSIM: {:.4e}'.format(avg_ssim))
+    summary = {
+        'overall': overall,
+        'by_patient_id': _summarize_rows(rows, 'patient_id'),
+        'by_met_id': _summarize_rows(rows, 'met_id'),
+        'by_lowres': _summarize_rows(rows, 'lowres'),
+    }
+    print(json.dumps(summary, ensure_ascii=False, indent=2))

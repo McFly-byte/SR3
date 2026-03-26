@@ -1,8 +1,30 @@
 import os
 import math
 import numpy as np
-import cv2
-from torchvision.utils import make_grid
+import torch
+try:
+    import cv2
+except Exception:
+    cv2 = None
+from PIL import Image
+
+
+def _make_grid_fallback(tensor, nrow=8, padding=2, pad_value=0):
+    if tensor.dim() != 4:
+        raise ValueError(f"Expected 4D tensor, got {tuple(tensor.shape)}")
+    n_img, channels, h, w = tensor.shape
+    nrow = max(1, min(int(nrow), n_img))
+    ncol = int(math.ceil(float(n_img) / nrow))
+    grid_h = ncol * h + padding * (ncol - 1)
+    grid_w = nrow * w + padding * (nrow - 1)
+    grid = torch.full((channels, grid_h, grid_w), float(pad_value), dtype=tensor.dtype, device=tensor.device)
+    for idx in range(n_img):
+        r = idx // nrow
+        c = idx % nrow
+        y0 = r * (h + padding)
+        x0 = c * (w + padding)
+        grid[:, y0:y0 + h, x0:x0 + w] = tensor[idx]
+    return grid
 
 
 def tensor2img(tensor, out_type=np.uint8, min_max=(-1, 1)):
@@ -17,8 +39,9 @@ def tensor2img(tensor, out_type=np.uint8, min_max=(-1, 1)):
     n_dim = tensor.dim()
     if n_dim == 4:
         n_img = len(tensor)
-        img_np = make_grid(tensor, nrow=int(
-            math.sqrt(n_img)), normalize=False).numpy()
+        img_np = _make_grid_fallback(
+            tensor, nrow=int(math.sqrt(n_img)), padding=2, pad_value=0
+        ).numpy()
         img_np = np.transpose(img_np, (1, 2, 0))  # HWC, RGB
     elif n_dim == 3:
         img_np = tensor.numpy()
@@ -35,8 +58,24 @@ def tensor2img(tensor, out_type=np.uint8, min_max=(-1, 1)):
 
 
 def save_img(img, img_path, mode='RGB'):
-    cv2.imwrite(img_path, cv2.cvtColor(img, cv2.COLOR_RGB2BGR))
-    # cv2.imwrite(img_path, img)
+    if img.ndim == 3 and img.shape[2] == 1:
+        img = img[:, :, 0]
+    if cv2 is not None:
+        if img.ndim == 2:
+            cv2.imwrite(img_path, img)
+            return
+        if img.ndim == 3 and img.shape[2] >= 3:
+            cv2.imwrite(img_path, cv2.cvtColor(img[:, :, :3], cv2.COLOR_RGB2BGR))
+            return
+        raise ValueError(f"Unsupported image shape for save_img: {img.shape}")
+    # PIL fallback when OpenCV is unavailable.
+    if img.ndim == 2:
+        Image.fromarray(img.astype(np.uint8), mode='L').save(img_path)
+        return
+    if img.ndim == 3 and img.shape[2] >= 3:
+        Image.fromarray(img[:, :, :3].astype(np.uint8), mode='RGB').save(img_path)
+        return
+    raise ValueError(f"Unsupported image shape for save_img without cv2: {img.shape}")
 
 
 def calculate_psnr(img1, img2):
@@ -50,6 +89,12 @@ def calculate_psnr(img1, img2):
 
 
 def ssim(img1, img2):
+    if cv2 is None:
+        # Fallback to skimage when OpenCV is unavailable.
+        from skimage.metrics import structural_similarity as sk_ssim
+        data_range = float(max(1.0, img2.max() - img2.min()))
+        return float(sk_ssim(img1.astype(np.float64), img2.astype(np.float64), data_range=data_range))
+
     C1 = (0.01 * 255)**2
     C2 = (0.03 * 255)**2
 
@@ -85,7 +130,7 @@ def calculate_ssim(img1, img2):
         if img1.shape[2] == 3:
             ssims = []
             for i in range(3):
-                ssims.append(ssim(img1, img2))
+                ssims.append(ssim(img1[:, :, i], img2[:, :, i]))
             return np.array(ssims).mean()
         elif img1.shape[2] == 1:
             return ssim(np.squeeze(img1), np.squeeze(img2))
