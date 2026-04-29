@@ -13,7 +13,7 @@ logger = logging.getLogger('base')
 
 def weights_init_normal(m, std=0.02):
     classname = m.__class__.__name__
-    if classname.find('Conv') != -1:
+    if classname.find('Conv') != -1 and hasattr(m, 'weight'):
         init.normal_(m.weight.data, 0.0, std)
         if m.bias is not None:
             m.bias.data.zero_()
@@ -28,7 +28,7 @@ def weights_init_normal(m, std=0.02):
 
 def weights_init_kaiming(m, scale=1):
     classname = m.__class__.__name__
-    if classname.find('Conv2d') != -1:
+    if classname.find('Conv2d') != -1 and hasattr(m, 'weight'):
         init.kaiming_normal_(m.weight.data, a=0, mode='fan_in')
         m.weight.data *= scale
         if m.bias is not None:
@@ -45,7 +45,7 @@ def weights_init_kaiming(m, scale=1):
 
 def weights_init_orthogonal(m):
     classname = m.__class__.__name__
-    if classname.find('Conv') != -1:
+    if classname.find('Conv') != -1 and hasattr(m, 'weight'):
         init.orthogonal_(m.weight.data, gain=1)
         if m.bias is not None:
             m.bias.data.zero_()
@@ -124,6 +124,8 @@ def define_G(opt):
             raise ValueError('model.unet.in_channel must be provided for non-MRSI datasets.')
     t1_in_channel = model_opt['unet'].get('t1_in_channel', 0)
     t1_cross_attn_res = model_opt['unet'].get('t1_cross_attn_res', None)
+    condition_layout = model_opt.get('condition_layout', model_opt['unet'].get('condition_layout', None))
+    condition_adapter = model_opt.get('condition_adapter', model_opt['unet'].get('condition_adapter', None))
     model = unet.UNet(
         in_channel=model_opt['unet']['in_channel'],
         out_channel=model_opt['unet']['out_channel'],
@@ -136,6 +138,11 @@ def define_G(opt):
         image_size=model_opt['diffusion']['image_size'],
         t1_in_channel=t1_in_channel,
         t1_cross_attn_res=t1_cross_attn_res,
+        t1_encoder_zero_init=model_opt['unet'].get('t1_encoder_zero_init', False),
+        adapter_zero_init=model_opt['unet'].get('adapter_zero_init', True),
+        adapter_init_scale=model_opt['unet'].get('adapter_init_scale', 1e-3),
+        condition_layout=condition_layout,
+        condition_adapter=condition_adapter,
     )
     netG = diffusion.GaussianDiffusion(
         model,
@@ -156,10 +163,15 @@ def define_G(opt):
         degradation_loss_weight=model_opt['diffusion'].get('degradation_loss_weight', 0.0),
         degradation_window=model_opt['diffusion'].get('degradation_window', 'hamming'),
         condition_dropout_prob=model_opt['diffusion'].get('condition_dropout_prob', 0.0),
+        condition_layout=condition_layout,
+        condition_adapter=condition_adapter,
     )
     if opt['phase'] == 'train':
         # init_weights(netG, init_type='kaiming', scale=0.1)
         init_weights(netG, init_type='orthogonal')
+        denoise_fn = netG.denoise_fn.module if hasattr(netG.denoise_fn, 'module') else netG.denoise_fn
+        if hasattr(denoise_fn, 'reset_condition_branch_parameters'):
+            denoise_fn.reset_condition_branch_parameters()
     if opt.get('gpu_ids') and opt.get('distributed'):
         assert torch.cuda.is_available()
         local_rank = int(opt.get('local_rank', 0))

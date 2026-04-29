@@ -1,4 +1,5 @@
 import math
+import inspect
 import torch
 from torch import device, nn, einsum
 import torch.nn.functional as F
@@ -92,6 +93,8 @@ class GaussianDiffusion(nn.Module):
         degradation_loss_weight=0.0,
         degradation_window="hamming",
         condition_dropout_prob=0.0,
+        condition_layout=None,
+        condition_adapter=None,
     ):
         super().__init__()
         self.channels = channels
@@ -115,10 +118,61 @@ class GaussianDiffusion(nn.Module):
         self.degradation_loss_weight = float(degradation_loss_weight)
         self.degradation_window = degradation_window
         self.condition_dropout_prob = float(condition_dropout_prob)
+        self.condition_layout = condition_layout or {
+            "lr": [0, 1],
+            "t1": [1, 2],
+            "flair": [2, 3],
+            "met_onehot": [3, 7],
+            "mask": None,
+        }
+        self.condition_adapter = condition_adapter or {}
+        self.use_condition_adapter = bool(self.condition_adapter.get("enabled", False))
+        denoise_fn = self.denoise_fn.module if hasattr(self.denoise_fn, 'module') else self.denoise_fn
+        try:
+            forward_params = inspect.signature(denoise_fn.forward).parameters
+            self._denoise_accepts_cond = "cond" in forward_params
+            self._denoise_accepts_t1_feat = "t1_feat" in forward_params
+        except (TypeError, ValueError):
+            self._denoise_accepts_cond = False
+            self._denoise_accepts_t1_feat = False
         self.last_loss_dict = {}
         if schedule_opt is not None:
             pass
             # self.set_new_noise_schedule(schedule_opt)
+
+    def _slice_condition(self, condition_x, key):
+        spec = self.condition_layout.get(key)
+        if condition_x is None or spec is None:
+            return None
+        if isinstance(spec, int):
+            start, end = spec, spec + 1
+        else:
+            start, end = int(spec[0]), int(spec[1])
+        if start < 0 or end > condition_x.shape[1] or end <= start:
+            return None
+        return condition_x[:, start:end, :, :]
+
+    def _build_cond_dict(self, condition_x, mask=None):
+        if not self.use_condition_adapter:
+            return None
+        cond = {
+            "lr": self._slice_condition(condition_x, "lr"),
+            "t1": self._slice_condition(condition_x, "t1"),
+            "flair": self._slice_condition(condition_x, "flair"),
+            "met_onehot": self._slice_condition(condition_x, "met_onehot"),
+            "mask": self._slice_condition(condition_x, "mask"),
+        }
+        if cond["mask"] is None and mask is not None:
+            cond["mask"] = mask
+        return cond
+
+    def _call_denoise_fn(self, model_input, noise_level, t1_feat=None, cond=None):
+        kwargs = {}
+        if self._denoise_accepts_t1_feat:
+            kwargs["t1_feat"] = t1_feat
+        if cond is not None and self._denoise_accepts_cond:
+            kwargs["cond"] = cond
+        return self.denoise_fn(model_input, noise_level, **kwargs)
 
     def _get_t1_feat(self, condition_x):
         """Extract T1 features via UNet's T1Encoder if cross-attention is enabled."""
@@ -213,13 +267,20 @@ class GaussianDiffusion(nn.Module):
             [self.sqrt_alphas_cumprod_prev[t+1]]).repeat(batch_size, 1).to(x.device)
         if condition_x is not None:
             t1_feat = self._get_t1_feat(condition_x)
+            cond = self._build_cond_dict(condition_x)
             x_recon = self.predict_start_from_noise(
-                x, t=t, noise=self.denoise_fn(
-                    torch.cat([condition_x, x], dim=1), noise_level, t1_feat=t1_feat
-                ))
+                x,
+                t=t,
+                noise=self._call_denoise_fn(
+                    torch.cat([condition_x, x], dim=1),
+                    noise_level,
+                    t1_feat=t1_feat,
+                    cond=cond,
+                ),
+            )
         else:
             x_recon = self.predict_start_from_noise(
-                x, t=t, noise=self.denoise_fn(x, noise_level))
+                x, t=t, noise=self._call_denoise_fn(x, noise_level))
 
         if clip_denoised:
             x_recon.clamp_(-1., 1.)
@@ -269,11 +330,13 @@ class GaussianDiffusion(nn.Module):
                 generator=generator,
             )
             t1_feat = self._get_t1_feat(x)
+            cond = self._build_cond_dict(x)
         else:
             shape = x_in
             img = torch.randn(shape, device=device, generator=generator)
             x = None
             t1_feat = None
+            cond = None
 
         ret_img = img
         sample_inter = max(1, len(timesteps) // 10)
@@ -290,9 +353,14 @@ class GaussianDiffusion(nn.Module):
             ).repeat(img.shape[0], 1).to(device)
 
             if x is not None:
-                pred_noise = self.denoise_fn(torch.cat([x, img], dim=1), noise_level, t1_feat=t1_feat)
+                pred_noise = self._call_denoise_fn(
+                    torch.cat([x, img], dim=1),
+                    noise_level,
+                    t1_feat=t1_feat,
+                    cond=cond,
+                )
             else:
-                pred_noise = self.denoise_fn(img, noise_level)
+                pred_noise = self._call_denoise_fn(img, noise_level)
 
             # Predict x_0 from x_t and predicted noise
             pred_x0 = (img - (1.0 - alpha_t).sqrt() * pred_noise) / alpha_t.sqrt()
@@ -424,14 +492,16 @@ class GaussianDiffusion(nn.Module):
         )
 
         if not self.conditional:
-            x_recon = self.denoise_fn(x_noisy, continuous_sqrt_alpha_cumprod_emb)
+            x_recon = self._call_denoise_fn(x_noisy, continuous_sqrt_alpha_cumprod_emb)
         else:
             condition_sr = self._maybe_drop_condition(x_in['SR'])
             t1_feat = self._get_t1_feat(condition_sr)
-            x_recon = self.denoise_fn(
+            cond = self._build_cond_dict(condition_sr, mask=x_in.get('MASK', None))
+            x_recon = self._call_denoise_fn(
                 torch.cat([condition_sr, x_noisy], dim=1),
                 continuous_sqrt_alpha_cumprod_emb,
                 t1_feat=t1_feat,
+                cond=cond,
             )
 
         # Mask-weighted pixel loss: ROI pixels receive higher gradient weight

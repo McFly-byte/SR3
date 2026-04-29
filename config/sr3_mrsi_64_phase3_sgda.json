@@ -1,0 +1,177 @@
+{
+    "name": "sr3_mrsi_64_phase3_sgda",
+    "phase": "train",
+    "gpu_ids": [0, 1, 2],
+    "path": {
+        "log": "logs",
+        "tb_logger": "tb_logger",
+        "results": "results",
+        "checkpoint": "checkpoint",
+        "resume_state": null
+    },
+    "datasets": {
+        "train": {
+            "name": "MRSI_train",
+            "mode": "MRSI_SR3",
+            "dataroot": "dataset_mrsi/mrsi_sr3_64/train",
+            "datatype": "npz",
+            "l_resolution": 64,
+            "r_resolution": 64,
+            "batch_size": 48,
+            "num_workers": 8,
+            "use_shuffle": true,
+            "data_len": -1,
+            "hflip": true,
+            "vflip": false,
+            "use_lr": true,
+            "use_t1": true,
+            "use_flair": true,
+            "use_met_onehot": true,
+            "use_mask_channel": false,
+            "strict_check": false
+        },
+        "val": {
+            "name": "MRSI_val",
+            "mode": "MRSI_SR3",
+            "dataroot": "dataset_mrsi/mrsi_sr3_64/val",
+            "datatype": "npz",
+            "l_resolution": 64,
+            "r_resolution": 64,
+            "data_len": -1,
+            "hflip": false,
+            "vflip": false,
+            "use_lr": true,
+            "use_t1": true,
+            "use_flair": true,
+            "use_met_onehot": true,
+            "use_mask_channel": false,
+            "strict_check": false
+        },
+        "test": {
+            "name": "MRSI_test",
+            "mode": "MRSI_SR3",
+            "dataroot": "dataset_mrsi/mrsi_sr3_64/test",
+            "datatype": "npz",
+            "l_resolution": 64,
+            "r_resolution": 64,
+            "data_len": -1,
+            "hflip": false,
+            "vflip": false,
+            "use_lr": true,
+            "use_t1": true,
+            "use_flair": true,
+            "use_met_onehot": true,
+            "use_mask_channel": false,
+            "strict_check": false
+        }
+    },
+    "model": {
+        "which_model_G": "sr3",
+        "finetune_norm": false,
+        "unet": {
+            "in_channel": 0,
+            "out_channel": 1,
+            "inner_channel": 64,
+            "channel_multiplier": [1, 2, 4, 8],
+            "attn_res": [16, 32],
+            "res_blocks": 2,
+            "dropout": 0.1,
+            "t1_in_channel": 0,
+            "t1_cross_attn_res": [16, 32],
+            "t1_encoder_zero_init": false,
+            "adapter_zero_init": true,
+            "adapter_init_scale": 1e-3
+        },
+        "condition_layout": {
+            "lr": [0, 1],
+            "t1": [1, 2],
+            "flair": [2, 3],
+            "met_onehot": [3, 7],
+            "mask": null
+        },
+        "condition_adapter": {
+            "enabled": true,
+            "fusion_type": "sgda_gated_add",
+            "fusion_res": [16, 32],
+            "use_lr_adapter": true,
+            "use_structure_adapter": true,
+            "use_t1": true,
+            "use_flair": true,
+            "use_structure_edges": true,
+            "use_met_film": true,
+            "adapter_channels": 64,
+            "adapter_zero_init": true,
+            "adapter_init_scale": 1e-3,
+            "structure_gate": true,
+            "lr_priority": true
+        },
+        "beta_schedule": {
+            "train": {
+                "schedule": "cosine",
+                "n_timestep": 1000,
+                "linear_start": 1e-6,
+                "linear_end": 1e-2
+            },
+            "val": {
+                "schedule": "cosine",
+                "n_timestep": 1000,
+                "linear_start": 1e-6,
+                "linear_end": 1e-2
+            }
+        },
+        "diffusion": {
+            "image_size": 64,
+            "channels": 1,
+            "conditional": true,
+            "loss_type": "l1",
+            "sampler_type": "ddim",
+            "sample_num_steps": 50,
+            "mask_loss_weight": 2.0,
+            "freq_loss_weight": 0.1,
+            "t1_channel_idx": -1,
+            "x0_loss_weight": 0.0,
+            "roi_mean_loss_weight": 0.0,
+            "grad_loss_weight": 0.0,
+            "freq_x0_loss_weight": 0.0,
+            "degradation_loss_weight": 0.0,
+            "degradation_window": "hamming",
+            "condition_dropout_prob": 0.0
+        }
+    },
+    "metrics": {
+        "enable_lpips": true,
+        "lpips_net": "alex",
+        "enable_frc": true,
+        "frc_apodize": true,
+        "enable_dmi_metrics": true
+    },
+    "validation": {
+        "split": "val",
+        "fixed_seed": 0,
+        "sample_num_steps": 50,
+        "save_image_count": 4,
+        "save_process": false
+    },
+    "train": {
+        "seed": 0,
+        "deterministic": false,
+        "cudnn_benchmark": true,
+        "n_iter": 300000,
+        "val_freq": 2000,
+        "save_checkpoint_freq": 5000,
+        "print_freq": 100,
+        "val_max_samples": -1,
+        "optimizer": {
+            "type": "adam",
+            "lr": 1e-4
+        },
+        "ema_scheduler": {
+            "step_start_ema": 5000,
+            "update_ema_every": 1,
+            "ema_decay": 0.9999
+        }
+    },
+    "wandb": {
+        "project": "sr3_mrsi"
+    }
+}
