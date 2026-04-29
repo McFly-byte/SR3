@@ -66,10 +66,18 @@ def create_dataset(dataset_opt, phase):
             data_len=dataset_opt.get('data_len', -1),
             hflip=dataset_opt.get('hflip', True),
             vflip=dataset_opt.get('vflip', False),
+            use_lr=dataset_opt.get('use_lr', True),
+            use_t1=dataset_opt.get('use_t1', True),
+            use_flair=dataset_opt.get('use_flair', True),
+            use_met_onehot=dataset_opt.get('use_met_onehot', True),
+            use_mask_channel=dataset_opt.get('use_mask_channel', False),
+            strict_check=dataset_opt.get('strict_check', False),
         )
     else:
         raise NotImplementedError('Dataset mode [{:s}] is not found.'.format(mode))
     logger = logging.getLogger('base')
     logger.info('Dataset [{:s} - {:s}] is created.'.format(dataset.__class__.__name__,
                                                            dataset_opt['name']))
+    if hasattr(dataset, 'condition_layout'):
+        logger.info('MRSI condition layout: {}'.format(', '.join(dataset.condition_layout)))
     return dataset

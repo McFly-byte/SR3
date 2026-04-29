@@ -3,7 +3,13 @@ import os.path as osp
 import logging
 from collections import OrderedDict
 import json
+import hashlib
+import random
+import subprocess
 from datetime import datetime
+
+import numpy as np
+import torch
 
 
 def mkdirs(paths):
@@ -23,6 +29,73 @@ def get_dist_info():
     world_size = int(os.environ.get('WORLD_SIZE', '1'))
     local_rank = int(os.environ.get('LOCAL_RANK', '0'))
     return rank, world_size, local_rank
+
+
+def _sha256_file(path):
+    h = hashlib.sha256()
+    with open(path, 'rb') as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b''):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def set_random_seed(seed, deterministic=False):
+    seed = int(seed)
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+    if deterministic:
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+
+
+def _git_output(args):
+    try:
+        return subprocess.check_output(args, stderr=subprocess.DEVNULL, text=True).strip()
+    except Exception:
+        return None
+
+
+def save_experiment_snapshot(opt, opt_path):
+    root = opt['path'].get('experiments_root')
+    if not root or not opt.get('is_main_process', True):
+        return
+    mkdirs(root)
+    with open(os.path.join(root, 'config_resolved.json'), 'w', encoding='utf-8') as f:
+        json.dump(opt, f, indent=2, ensure_ascii=False)
+    if opt_path and os.path.exists(opt_path):
+        with open(os.path.join(root, 'config_source_sha256.txt'), 'w', encoding='utf-8') as f:
+            f.write(_sha256_file(opt_path) + '\n')
+
+    commit = _git_output(['git', 'rev-parse', 'HEAD'])
+    status = _git_output(['git', 'status', '--short'])
+    if commit:
+        with open(os.path.join(root, 'git_commit.txt'), 'w', encoding='utf-8') as f:
+            f.write(commit + '\n')
+    if status is not None:
+        with open(os.path.join(root, 'git_status_short.txt'), 'w', encoding='utf-8') as f:
+            f.write(status + '\n')
+
+    manifest_hashes = {}
+    for phase, dataset_opt in opt.get('datasets', {}).items():
+        dataroot = dataset_opt.get('dataroot')
+        if not dataroot:
+            continue
+        candidates = [
+            os.path.join(dataroot, 'manifest.csv'),
+            os.path.join(dataroot, phase, 'manifest.csv'),
+        ]
+        for manifest in candidates:
+            if os.path.exists(manifest):
+                manifest_hashes[phase] = {
+                    'path': manifest,
+                    'sha256': _sha256_file(manifest),
+                }
+                break
+    with open(os.path.join(root, 'manifest_hashes.json'), 'w', encoding='utf-8') as f:
+        json.dump(manifest_hashes, f, indent=2, ensure_ascii=False)
 
 
 def is_main_process():
@@ -83,6 +156,11 @@ def parse(args):
     opt['local_rank'] = local_rank
     opt['distributed'] = bool(world_size > 1)
     opt['is_main_process'] = bool(rank == 0)
+    if os.name == 'nt' and world_size > 1:
+        print(
+            '[提示] Windows 多进程 WORLD_SIZE=%d：若 torchrun 初始化失败，请改用 DataParallel：'
+            ' python train_windows_3gpu.py -p train -c %s' % (world_size, opt_path)
+        )
 
     # debug
     if 'debug' in opt['name']:
@@ -115,6 +193,7 @@ def parse(args):
     except:
         pass
     opt['enable_wandb'] = enable_wandb
+    save_experiment_snapshot(opt, opt_path)
     
     return opt
 

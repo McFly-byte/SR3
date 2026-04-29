@@ -101,6 +101,8 @@ def _resolve_mrsi_in_channel(opt):
         cond_channels += 1
     if target_dataset_opt.get('use_met_onehot', True):
         cond_channels += 4
+    if target_dataset_opt.get('use_mask_channel', False):
+        cond_channels += 1
 
     target_channels = int(opt['model']['diffusion']['channels'])
     return cond_channels + target_channels
@@ -139,7 +141,7 @@ def define_G(opt):
         model,
         image_size=model_opt['diffusion']['image_size'],
         channels=model_opt['diffusion']['channels'],
-        loss_type='l1',    # L1 or L2
+        loss_type=model_opt['diffusion'].get('loss_type', 'l1'),
         conditional=model_opt['diffusion']['conditional'],
         schedule_opt=model_opt['beta_schedule']['train'],
         sampler_type=model_opt['diffusion'].get('sampler_type', 'ddpm'),
@@ -147,6 +149,13 @@ def define_G(opt):
         mask_loss_weight=model_opt['diffusion'].get('mask_loss_weight', 2.0),
         freq_loss_weight=model_opt['diffusion'].get('freq_loss_weight', 0.0),
         t1_channel_idx=model_opt['diffusion'].get('t1_channel_idx', -1),
+        x0_loss_weight=model_opt['diffusion'].get('x0_loss_weight', 0.0),
+        roi_mean_loss_weight=model_opt['diffusion'].get('roi_mean_loss_weight', 0.0),
+        grad_loss_weight=model_opt['diffusion'].get('grad_loss_weight', 0.0),
+        freq_x0_loss_weight=model_opt['diffusion'].get('freq_x0_loss_weight', 0.0),
+        degradation_loss_weight=model_opt['diffusion'].get('degradation_loss_weight', 0.0),
+        degradation_window=model_opt['diffusion'].get('degradation_window', 'hamming'),
+        condition_dropout_prob=model_opt['diffusion'].get('condition_dropout_prob', 0.0),
     )
     if opt['phase'] == 'train':
         # init_weights(netG, init_type='kaiming', scale=0.1)

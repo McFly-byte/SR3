@@ -42,8 +42,11 @@ if __name__ == "__main__":
     opt = Logger.dict_to_nonedict(opt)
 
     # logging
+    train_opt = opt.get('train', {}) or {}
+    deterministic = bool(train_opt.get('deterministic', False))
     torch.backends.cudnn.enabled = True
-    torch.backends.cudnn.benchmark = True
+    torch.backends.cudnn.benchmark = bool(train_opt.get('cudnn_benchmark', not deterministic))
+    torch.backends.cudnn.deterministic = bool(train_opt.get('cudnn_deterministic', deterministic))
 
     Logger.setup_logger(None, opt['path']['log'],
                         'train', level=logging.INFO, screen=True)
@@ -58,8 +61,7 @@ if __name__ == "__main__":
     else:
         wandb_logger = None
 
-    seed = int(opt.get('train', {}).get('seed', 0) or 0)
-    deterministic = bool(opt.get('train', {}).get('deterministic', False))
+    seed = int(train_opt.get('seed', 0) or 0)
     Logger.set_random_seed(seed, deterministic=deterministic)
 
     eval_loaders = {}

@@ -129,8 +129,6 @@ dmypy.json
 # Pyre type checker
 .pyre/
 
-*.lmdb
-
 # IDE and local settings
 .cursor/
 .vscode/
@@ -140,11 +138,25 @@ experiments/*
 !experiments/*/config.json
 !experiments/*/graph/
 
-# MRSI data (large)
-dataset_mrsi/mrsi_sr3_*/**/*.nii
-dataset_mrsi/mrsi_sr3_*/**/*.npy
-dataset_mrsi/*/run_config.json
+# Generated MRSI datasets and visual checks (large/local)
+dataset_mrsi/*
 !dataset_mrsi/mrsi_sr3_64_smoke/
+!dataset_mrsi/mrsi_sr3_64_smoke/**
+
+# Scientific data artifacts
+*.nii
+*.nii.gz
+*.npy
+*.npz
+*.mat
+*.h5
+*.hdf5
+*.lmdb
+
+# Generated dataset manifests / local visual inspection outputs
+dataset_mrsi/**/run_config.json
+dataset_mrsi/**/manifest*.csv
+dataset_mrsi/**/visual_check/
 
 # Windows specific
 *.bat

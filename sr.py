@@ -1,9 +1,15 @@
-# Fix for Windows: disable libuv if not supported (must be before any torch imports)
+# Fix for Windows: TCPStore/libuv — conda 等 Windows 版 PyTorch 常未带 libuv
 import os
-if os.name == 'nt' and 'USE_LIBUV' not in os.environ:
+if os.name == 'nt':
     os.environ['USE_LIBUV'] = '0'
 
 import torch
+import torch.distributed as dist
+
+from core.win_tcpstore_patch import apply_tcpstore_no_libuv_patch
+
+apply_tcpstore_no_libuv_patch()
+
 import data as Data
 import model as Model
 import argparse
@@ -12,14 +18,19 @@ import csv
 import json
 import core.logger as Logger
 import core.metrics as Metrics
-from core.sr_metrics import frc_2d, hfen_2d
+from core.sr_metrics import (
+    degradation_consistency_2d,
+    dmi_quant_metrics,
+    false_hotspot_rate,
+    frc_2d,
+    hfen_2d,
+)
 from core.wandb_logger import WandbLogger
 try:
     from tensorboardX import SummaryWriter
 except Exception:
     from torch.utils.tensorboard import SummaryWriter
 import numpy as np
-import torch.distributed as dist
 
 try:
     import lpips
@@ -31,6 +42,51 @@ def _safe_mean(vals):
     if len(vals) == 0:
         return 0.0
     return float(np.mean(vals))
+
+
+def _as_scalar(data, key, default=-1):
+    if key not in data:
+        return default
+    val = data[key]
+    if torch.is_tensor(val):
+        return int(val.view(-1)[0].item())
+    if isinstance(val, (list, tuple)):
+        return val[0] if val else default
+    return val
+
+
+def _masked_ssim_from_imgs(sr_img, hr_img, mask_t):
+    if mask_t is None:
+        return None
+    mask_np = mask_t.squeeze().detach().float().cpu().numpy()
+    mask_np = (mask_np > 0.5).astype(np.float32)
+    if sr_img.ndim == 3:
+        mask_np = mask_np[:, :, None]
+    sr_masked = (sr_img.astype(np.float32) * mask_np).astype(sr_img.dtype)
+    hr_masked = (hr_img.astype(np.float32) * mask_np).astype(hr_img.dtype)
+    try:
+        return float(Metrics.calculate_ssim(sr_masked, hr_masked))
+    except Exception:
+        return None
+
+
+@torch.no_grad()
+def _compute_dmi_metrics(sr_t, hr_t, lr_t, mask_t, lowres, kspace_window="hamming"):
+    out = {}
+    try:
+        out.update(dmi_quant_metrics(sr_t, hr_t, mask=mask_t))
+    except Exception:
+        pass
+    try:
+        out.update(false_hotspot_rate(sr_t, hr_t, mask=mask_t))
+    except Exception:
+        pass
+    try:
+        lowres_half = None if lowres in (None, -1) else int(lowres)
+        out.update(degradation_consistency_2d(sr_t, lr_t, mask=mask_t, lowres_half=lowres_half, window=kspace_window))
+    except Exception:
+        pass
+    return out
 
 
 def _to_4d(t):
@@ -58,6 +114,12 @@ def _concat_for_tb(left, mid, right):
     b = _to_3ch_hwc(mid)
     c = _to_3ch_hwc(right)
     return np.transpose(np.concatenate((a, b, c), axis=1), [2, 0, 1])
+
+
+def _error_map_img(sr_t, hr_t):
+    sr01 = ((sr_t.detach().float().cpu() + 1.0) * 0.5).clamp(0.0, 1.0)
+    hr01 = ((hr_t.detach().float().cpu() + 1.0) * 0.5).clamp(0.0, 1.0)
+    return Metrics.tensor2img(torch.abs(sr01 - hr01), min_max=(0, 1))
 
 
 def _build_lpips_model(opt, logger):
@@ -123,7 +185,14 @@ def _write_metrics_csv(rows, csv_path):
             f,
             fieldnames=[
                 'index', 'patient_id', 'slice_idx', 'met_id',
-                'psnr', 'ssim', 'lpips', 'hfen', 'frc_aucw', 'frc_hf', 'frc_cut'
+                'sample_id', 'split', 'met_name', 'lowres',
+                'psnr', 'ssim', 'masked_ssim', 'lpips', 'hfen', 'frc_aucw', 'frc_hf', 'frc_cut',
+                'masked_psnr', 'masked_mae',
+                'roi_mean_abs_err', 'roi_mean_rel_err',
+                'roi_std_abs_err', 'roi_std_rel_err',
+                'roi_sum_abs_err', 'roi_sum_rel_err',
+                'false_hotspot_rate', 'false_hotspot_precision_err',
+                'degradation_l1', 'degradation_rmse'
             ]
         )
         writer.writeheader()
@@ -138,10 +207,12 @@ def _init_dist_if_needed(opt):
     if not torch.cuda.is_available():
         raise RuntimeError('DDP requires CUDA for this project.')
     
-    # Force disable libuv on Windows before initializing
     if os.name == 'nt':
         os.environ['USE_LIBUV'] = '0'
-    
+        # 集群主机名在部分 Windows/C10d 场景下能解析仍报 10049；单机训练强制回环（多机设 DDP_USE_CLUSTER_MASTER=1）
+        if os.environ.get('DDP_USE_CLUSTER_MASTER', '').lower() not in ('1', 'true', 'yes'):
+            os.environ['MASTER_ADDR'] = '127.0.0.1'
+
     local_rank = int(opt.get('local_rank', 0))
     torch.cuda.set_device(local_rank)
 
@@ -151,17 +222,9 @@ def _init_dist_if_needed(opt):
     else:
         backend = 'nccl'
     
-    # Try to initialize with explicit store options to avoid libuv
-    try:
-        dist.init_process_group(backend=backend, init_method='env://')
-    except Exception as e:
-        if 'libuv' in str(e).lower():
-            # If still fails, try with explicit store
-            os.environ['USE_LIBUV'] = '0'
-            dist.init_process_group(backend=backend, init_method='env://')
-        else:
-            raise
-    
+    init_method = 'env://?use_libuv=0' if os.name == 'nt' else 'env://'
+    dist.init_process_group(backend=backend, init_method=init_method)
+
     return True
 
 
@@ -207,8 +270,13 @@ if __name__ == "__main__":
     _init_dist_if_needed(opt)
 
     # logging
+    train_opt = opt.get('train', {}) or {}
+    seed = int(train_opt.get('seed', 0) or 0)
+    deterministic = bool(train_opt.get('deterministic', False))
+    Logger.set_random_seed(seed, deterministic=deterministic)
     torch.backends.cudnn.enabled = True
-    torch.backends.cudnn.benchmark = True
+    torch.backends.cudnn.benchmark = bool(train_opt.get('cudnn_benchmark', not deterministic))
+    torch.backends.cudnn.deterministic = bool(train_opt.get('cudnn_deterministic', deterministic))
 
     logger = logging.getLogger('base')
     logger_val = logging.getLogger('val')
@@ -270,6 +338,7 @@ if __name__ == "__main__":
                 current_step += 1
                 if current_step > n_iter:
                     break
+                diffusion.current_step = current_step
                 diffusion.feed_data(train_data)
                 diffusion.optimize_parameters()
                 # log
@@ -298,6 +367,14 @@ if __name__ == "__main__":
                         frc_auc_vals = []
                         frc_hf_vals = []
                         frc_cut_vals = []
+                        dmi_metric_keys = [
+                            'masked_psnr', 'masked_mae', 'masked_ssim',
+                            'roi_mean_abs_err', 'roi_mean_rel_err',
+                            'roi_std_abs_err', 'roi_std_rel_err',
+                            'roi_sum_abs_err', 'roi_sum_rel_err',
+                            'false_hotspot_rate', 'false_hotspot_precision_err',
+                            'degradation_l1', 'degradation_rmse',
+                        ]
                         metric_rows = []
                         idx = 0
                         result_path = '{}/{}'.format(opt['path']
@@ -312,9 +389,13 @@ if __name__ == "__main__":
                             if val_max_samples > 0 and idx >= val_max_samples:
                                 break
                             idx += 1
-                            patient_id = int(val_data['PATIENT_ID'].view(-1)[0].item()) if 'PATIENT_ID' in val_data else -1
-                            slice_idx = int(val_data['SLICE_IDX'].view(-1)[0].item()) if 'SLICE_IDX' in val_data else -1
-                            met_id = int(val_data['MET_ID'].view(-1)[0].item()) if 'MET_ID' in val_data else -1
+                            patient_id = _as_scalar(val_data, 'PATIENT_ID', -1)
+                            slice_idx = _as_scalar(val_data, 'SLICE_IDX', -1)
+                            met_id = _as_scalar(val_data, 'MET_ID', -1)
+                            lowres = _as_scalar(val_data, 'LOWRES', -1)
+                            sample_id = _as_scalar(val_data, 'SAMPLE_ID', idx)
+                            split_name = _as_scalar(val_data, 'SPLIT', 'val')
+                            met_name = _as_scalar(val_data, 'MET_NAME', str(met_id))
                             diffusion.feed_data(val_data)
                             diffusion.test(continous=False)
                             visuals = diffusion.get_current_visuals()
@@ -331,11 +412,14 @@ if __name__ == "__main__":
                             sr_img = Metrics.tensor2img(sr_t)  # uint8
                             hr_img = Metrics.tensor2img(visuals['HR'])  # uint8
                             lr_img = Metrics.tensor2img(lr_t)  # uint8
+                            err_img = _error_map_img(sr_t, hr_t)
 
                             Metrics.save_img(
                                 hr_img, '{}/{}_{}_hr.png'.format(result_path, current_step, idx))
                             Metrics.save_img(
                                 sr_img, '{}/{}_{}_sr.png'.format(result_path, current_step, idx))
+                            Metrics.save_img(
+                                err_img, '{}/{}_{}_err.png'.format(result_path, current_step, idx))
                             Metrics.save_img(
                                 lr_img, '{}/{}_{}_lr.png'.format(result_path, current_step, idx))
                             Metrics.save_img(
@@ -347,9 +431,13 @@ if __name__ == "__main__":
 
                             eval_psnr = Metrics.calculate_psnr(sr_img, hr_img)
                             eval_ssim = Metrics.calculate_ssim(sr_img, hr_img)
+                            eval_masked_ssim = _masked_ssim_from_imgs(sr_img, hr_img, mask_t)
                             eval_lpips = _compute_lpips(lpips_model, sr_t, hr_t, mask_t=mask_t)
                             eval_hfen = _compute_hfen(sr_t, hr_t, mask_t=mask_t)
                             eval_frc_auc, eval_frc_hf, eval_frc_cut = _compute_frc(sr_t, hr_t, mask_t=mask_t, apodize=frc_apodize)
+                            dmi_metrics = _compute_dmi_metrics(sr_t, hr_t, lr_t, mask_t, lowres)
+                            if eval_masked_ssim is not None:
+                                dmi_metrics['masked_ssim'] = eval_masked_ssim
 
                             psnr_vals.append(float(eval_psnr))
                             ssim_vals.append(float(eval_ssim))
@@ -363,19 +451,26 @@ if __name__ == "__main__":
                                 frc_hf_vals.append(float(eval_frc_hf))
                             if eval_frc_cut is not None and np.isfinite(eval_frc_cut):
                                 frc_cut_vals.append(float(eval_frc_cut))
-                            metric_rows.append({
+                            metric_row = {
                                 'index': idx,
                                 'patient_id': patient_id,
                                 'slice_idx': slice_idx,
                                 'met_id': met_id,
+                                'sample_id': sample_id,
+                                'split': split_name,
+                                'met_name': met_name,
+                                'lowres': lowres,
                                 'psnr': float(eval_psnr),
                                 'ssim': float(eval_ssim),
+                                'masked_ssim': (None if eval_masked_ssim is None else float(eval_masked_ssim)),
                                 'lpips': (None if eval_lpips is None else float(eval_lpips)),
                                 'hfen': (None if eval_hfen is None else float(eval_hfen)),
                                 'frc_aucw': (None if eval_frc_auc is None else float(eval_frc_auc)),
                                 'frc_hf': (None if eval_frc_hf is None else float(eval_frc_hf)),
                                 'frc_cut': (None if eval_frc_cut is None else float(eval_frc_cut)),
-                            })
+                            }
+                            metric_row.update({key: dmi_metrics.get(key) for key in dmi_metric_keys if key != 'masked_ssim'})
+                            metric_rows.append(metric_row)
 
                             if wandb_logger:
                                 wandb_logger.log_image(
@@ -390,6 +485,13 @@ if __name__ == "__main__":
                         avg_frc_auc = _safe_mean(frc_auc_vals)
                         avg_frc_hf = _safe_mean(frc_hf_vals)
                         avg_frc_cut = _safe_mean(frc_cut_vals)
+                        avg_dmi = {
+                            key: _safe_mean([
+                                float(row[key]) for row in metric_rows
+                                if row.get(key) not in ('', 'None', None) and np.isfinite(float(row[key]))
+                            ])
+                            for key in dmi_metric_keys
+                        }
                         diffusion.set_new_noise_schedule(
                             opt['model']['beta_schedule']['train'], schedule_phase='train')
                         logger.info(
@@ -410,6 +512,8 @@ if __name__ == "__main__":
                         tb_logger.add_scalar('val/frc_aucw', avg_frc_auc, current_step)
                         tb_logger.add_scalar('val/frc_hf', avg_frc_hf, current_step)
                         tb_logger.add_scalar('val/frc_cut', avg_frc_cut, current_step)
+                        for key, value in avg_dmi.items():
+                            tb_logger.add_scalar(f'val/{key}', value, current_step)
 
                         csv_path = os.path.join(result_path, f'{current_step}_metrics.csv')
                         json_path = os.path.join(result_path, f'{current_step}_metrics.json')
@@ -427,6 +531,7 @@ if __name__ == "__main__":
                                     'frc_aucw': avg_frc_auc,
                                     'frc_hf': avg_frc_hf,
                                     'frc_cut': avg_frc_cut,
+                                    **avg_dmi,
                                 },
                                 f,
                                 ensure_ascii=False,
@@ -442,6 +547,7 @@ if __name__ == "__main__":
                                 'validation/val_frc_aucw': avg_frc_auc,
                                 'validation/val_frc_hf': avg_frc_hf,
                                 'validation/val_frc_cut': avg_frc_cut,
+                                **{f'validation/val_{key}': value for key, value in avg_dmi.items()},
                                 'validation/val_step': val_step
                             })
                             val_step += 1
@@ -474,6 +580,14 @@ if __name__ == "__main__":
         frc_auc_vals = []
         frc_hf_vals = []
         frc_cut_vals = []
+        dmi_metric_keys = [
+            'masked_psnr', 'masked_mae', 'masked_ssim',
+            'roi_mean_abs_err', 'roi_mean_rel_err',
+            'roi_std_abs_err', 'roi_std_rel_err',
+            'roi_sum_abs_err', 'roi_sum_rel_err',
+            'false_hotspot_rate', 'false_hotspot_precision_err',
+            'degradation_l1', 'degradation_rmse',
+        ]
         metric_rows = []
         idx = 0
         result_path = '{}'.format(opt['path']['results'])
@@ -481,9 +595,13 @@ if __name__ == "__main__":
         frc_apodize = bool(opt.get('metrics', {}).get('frc_apodize', True))
         for _,  val_data in enumerate(val_loader):
             idx += 1
-            patient_id = int(val_data['PATIENT_ID'].view(-1)[0].item()) if 'PATIENT_ID' in val_data else -1
-            slice_idx = int(val_data['SLICE_IDX'].view(-1)[0].item()) if 'SLICE_IDX' in val_data else -1
-            met_id = int(val_data['MET_ID'].view(-1)[0].item()) if 'MET_ID' in val_data else -1
+            patient_id = _as_scalar(val_data, 'PATIENT_ID', -1)
+            slice_idx = _as_scalar(val_data, 'SLICE_IDX', -1)
+            met_id = _as_scalar(val_data, 'MET_ID', -1)
+            lowres = _as_scalar(val_data, 'LOWRES', -1)
+            sample_id = _as_scalar(val_data, 'SAMPLE_ID', idx)
+            split_name = _as_scalar(val_data, 'SPLIT', 'val')
+            met_name = _as_scalar(val_data, 'MET_NAME', str(met_id))
             diffusion.feed_data(val_data)
             diffusion.test(continous=True)
             visuals = diffusion.get_current_visuals()
@@ -518,15 +636,22 @@ if __name__ == "__main__":
             # generation
             sr_last_t = visuals['SR'][-1]
             sr_last_img = Metrics.tensor2img(sr_last_t)
+            err_img = _error_map_img(sr_last_t, visuals['HR'])
+            Metrics.save_img(
+                err_img, '{}/{}_{}_err.png'.format(result_path, current_step, idx))
             mask_t = None
             if isinstance(diffusion.data, dict) and 'MASK' in diffusion.data:
                 mask_t = diffusion.data['MASK'].detach().float().cpu()
 
             eval_psnr = Metrics.calculate_psnr(sr_last_img, hr_img)
             eval_ssim = Metrics.calculate_ssim(sr_last_img, hr_img)
+            eval_masked_ssim = _masked_ssim_from_imgs(sr_last_img, hr_img, mask_t)
             eval_lpips = _compute_lpips(lpips_model, sr_last_t, visuals['HR'], mask_t=mask_t)
             eval_hfen = _compute_hfen(sr_last_t, visuals['HR'], mask_t=mask_t)
             eval_frc_auc, eval_frc_hf, eval_frc_cut = _compute_frc(sr_last_t, visuals['HR'], mask_t=mask_t, apodize=frc_apodize)
+            dmi_metrics = _compute_dmi_metrics(sr_last_t, visuals['HR'], visuals['LR'], mask_t, lowres)
+            if eval_masked_ssim is not None:
+                dmi_metrics['masked_ssim'] = eval_masked_ssim
 
             psnr_vals.append(float(eval_psnr))
             ssim_vals.append(float(eval_ssim))
@@ -540,19 +665,26 @@ if __name__ == "__main__":
                 frc_hf_vals.append(float(eval_frc_hf))
             if eval_frc_cut is not None and np.isfinite(eval_frc_cut):
                 frc_cut_vals.append(float(eval_frc_cut))
-            metric_rows.append({
+            metric_row = {
                 'index': idx,
                 'patient_id': patient_id,
                 'slice_idx': slice_idx,
                 'met_id': met_id,
+                'sample_id': sample_id,
+                'split': split_name,
+                'met_name': met_name,
+                'lowres': lowres,
                 'psnr': float(eval_psnr),
                 'ssim': float(eval_ssim),
+                'masked_ssim': (None if eval_masked_ssim is None else float(eval_masked_ssim)),
                 'lpips': (None if eval_lpips is None else float(eval_lpips)),
                 'hfen': (None if eval_hfen is None else float(eval_hfen)),
                 'frc_aucw': (None if eval_frc_auc is None else float(eval_frc_auc)),
                 'frc_hf': (None if eval_frc_hf is None else float(eval_frc_hf)),
                 'frc_cut': (None if eval_frc_cut is None else float(eval_frc_cut)),
-            })
+            }
+            metric_row.update({key: dmi_metrics.get(key) for key in dmi_metric_keys if key != 'masked_ssim'})
+            metric_rows.append(metric_row)
 
             if wandb_logger and opt['log_eval']:
                 wandb_logger.log_eval_data(cond_img, sr_last_img, hr_img, eval_psnr, eval_ssim)
@@ -564,6 +696,13 @@ if __name__ == "__main__":
         avg_frc_auc = _safe_mean(frc_auc_vals)
         avg_frc_hf = _safe_mean(frc_hf_vals)
         avg_frc_cut = _safe_mean(frc_cut_vals)
+        avg_dmi = {
+            key: _safe_mean([
+                float(row[key]) for row in metric_rows
+                if row.get(key) not in ('', 'None', None) and np.isfinite(float(row[key]))
+            ])
+            for key in dmi_metric_keys
+        }
 
         # log
         logger.info('# Validation # PSNR: {:.4e}'.format(avg_psnr))
@@ -573,6 +712,12 @@ if __name__ == "__main__":
         logger.info('# Validation # FRC_AUCw: {:.4e}'.format(avg_frc_auc))
         logger.info('# Validation # FRC_HF: {:.4e}'.format(avg_frc_hf))
         logger.info('# Validation # FRC_cut: {:.4e}'.format(avg_frc_cut))
+        logger.info('# Validation # masked_PSNR: {:.4e} ROI_mean_rel_err: {:.4e} false_hotspot_rate: {:.4e} degradation_l1: {:.4e}'.format(
+            avg_dmi.get('masked_psnr', 0.0),
+            avg_dmi.get('roi_mean_rel_err', 0.0),
+            avg_dmi.get('false_hotspot_rate', 0.0),
+            avg_dmi.get('degradation_l1', 0.0),
+        ))
         logger_val = logging.getLogger('val')  # validation logger
         logger_val.info(
             '<epoch:{:3d}, iter:{:8,d}> psnr: {:.4e}, ssim: {:.4e}, lpips: {:.4e}, hfen: {:.4e}, frc_aucw: {:.4e}, frc_hf: {:.4e}, frc_cut: {:.4e}'.format(
@@ -596,6 +741,7 @@ if __name__ == "__main__":
                     'frc_aucw': avg_frc_auc,
                     'frc_hf': avg_frc_hf,
                     'frc_cut': avg_frc_cut,
+                    **avg_dmi,
                 },
                 f,
                 ensure_ascii=False,
@@ -613,5 +759,6 @@ if __name__ == "__main__":
                 'FRC_AUCw': float(avg_frc_auc),
                 'FRC_HF': float(avg_frc_hf),
                 'FRC_cut': float(avg_frc_cut),
+                **{key: float(value) for key, value in avg_dmi.items()},
             })
     _cleanup_dist()

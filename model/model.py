@@ -100,6 +100,9 @@ class DDPM(BaseModel):
 
         # set log
         self.log_dict['l_pix'] = l_pix.item()
+        net = _unwrap_module(self.netG)
+        for key, value in getattr(net, 'last_loss_dict', {}).items():
+            self.log_dict[key] = float(value)
         self.log_dict['skipped_step'] = 0.0
         return True
 

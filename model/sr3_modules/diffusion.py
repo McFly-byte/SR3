@@ -7,6 +7,14 @@ from functools import partial
 import numpy as np
 from tqdm import tqdm
 
+from .losses import (
+    degradation_l1_sum,
+    frequency_l1_sum,
+    gradient_l1_sum,
+    masked_l1_sum,
+    roi_mean_consistency_sum,
+)
+
 
 def _warmup_beta(linear_start, linear_end, n_timestep, warmup_frac):
     betas = linear_end * np.ones(n_timestep, dtype=np.float64)
@@ -77,6 +85,13 @@ class GaussianDiffusion(nn.Module):
         # T1 cross-attention: index of the T1 channel within the condition tensor
         # Set to -1 (default) to disable; set to e.g. 1 for MRSI (LR=0, T1=1)
         t1_channel_idx=-1,
+        x0_loss_weight=0.0,
+        roi_mean_loss_weight=0.0,
+        grad_loss_weight=0.0,
+        freq_x0_loss_weight=0.0,
+        degradation_loss_weight=0.0,
+        degradation_window="hamming",
+        condition_dropout_prob=0.0,
     ):
         super().__init__()
         self.channels = channels
@@ -93,6 +108,14 @@ class GaussianDiffusion(nn.Module):
         # Index of the T1 image channel within the stacked condition tensor
         # Used to extract T1 before forwarding to UNet's T1Encoder
         self.t1_channel_idx = int(t1_channel_idx)
+        self.x0_loss_weight = float(x0_loss_weight)
+        self.roi_mean_loss_weight = float(roi_mean_loss_weight)
+        self.grad_loss_weight = float(grad_loss_weight)
+        self.freq_x0_loss_weight = float(freq_x0_loss_weight)
+        self.degradation_loss_weight = float(degradation_loss_weight)
+        self.degradation_window = degradation_window
+        self.condition_dropout_prob = float(condition_dropout_prob)
+        self.last_loss_dict = {}
         if schedule_opt is not None:
             pass
             # self.set_new_noise_schedule(schedule_opt)
@@ -101,11 +124,19 @@ class GaussianDiffusion(nn.Module):
         """Extract T1 features via UNet's T1Encoder if cross-attention is enabled."""
         if self.t1_channel_idx < 0:
             return None
+        if condition_x is None or self.t1_channel_idx + 1 > condition_x.shape[1]:
+            return None
         denoise_fn = self.denoise_fn.module if hasattr(self.denoise_fn, 'module') else self.denoise_fn
         if not getattr(denoise_fn, 'use_t1_cross_attn', False):
             return None
         t1_img = condition_x[:, self.t1_channel_idx:self.t1_channel_idx + 1, :, :]
         return denoise_fn.t1_encoder(t1_img)
+
+    def _maybe_drop_condition(self, condition_x):
+        if (not self.training) or self.condition_dropout_prob <= 0.0:
+            return condition_x
+        keep = torch.rand((condition_x.shape[0], 1, 1, 1), device=condition_x.device) >= self.condition_dropout_prob
+        return condition_x * keep.to(condition_x.dtype)
 
     def set_loss(self, device):
         if self.loss_type == 'l1':
@@ -363,6 +394,9 @@ class GaussianDiffusion(nn.Module):
         mag_pred = torch.abs(fft_pred)
         return F.l1_loss(mag_pred, mag_target, reduction='sum')
 
+    def _predict_x0_from_continuous_noise(self, x_noisy, pred_noise, sqrt_alpha):
+        return (x_noisy - (1.0 - sqrt_alpha ** 2).sqrt() * pred_noise) / sqrt_alpha.clamp_min(1e-8)
+
     def p_losses(self, x_in, noise=None):
         x_start = x_in['HR']
         [b, c, h, w] = x_start.shape
@@ -392,7 +426,7 @@ class GaussianDiffusion(nn.Module):
         if not self.conditional:
             x_recon = self.denoise_fn(x_noisy, continuous_sqrt_alpha_cumprod_emb)
         else:
-            condition_sr = x_in['SR']
+            condition_sr = self._maybe_drop_condition(x_in['SR'])
             t1_feat = self._get_t1_feat(condition_sr)
             x_recon = self.denoise_fn(
                 torch.cat([condition_sr, x_noisy], dim=1),
@@ -409,12 +443,64 @@ class GaussianDiffusion(nn.Module):
         else:
             pixel_loss = self.loss_func(noise, x_recon)
 
-        if self.freq_loss_weight > 0.0:
-            loss = pixel_loss + self.freq_loss_weight * self._freq_loss(noise, x_recon)
-        else:
-            loss = pixel_loss
+        loss = pixel_loss
+        loss_terms = {"loss/noise": pixel_loss.detach() / float(x_start.numel())}
 
-        return loss
+        if self.freq_loss_weight > 0.0:
+            freq_noise = self._freq_loss(noise, x_recon)
+            loss = loss + self.freq_loss_weight * freq_noise
+            loss_terms["loss/freq_noise"] = freq_noise.detach() / float(x_start.numel())
+
+        needs_x0 = any(
+            weight > 0.0 for weight in [
+                self.x0_loss_weight,
+                self.roi_mean_loss_weight,
+                self.grad_loss_weight,
+                self.freq_x0_loss_weight,
+                self.degradation_loss_weight,
+            ]
+        )
+        if needs_x0:
+            x0_hat = self._predict_x0_from_continuous_noise(
+                x_noisy,
+                x_recon,
+                continuous_sqrt_alpha_cumprod_spatial,
+            ).clamp(-1.0, 1.0)
+            if self.x0_loss_weight > 0.0:
+                x0_l1 = masked_l1_sum(x0_hat, x_start, mask=mask)
+                loss = loss + self.x0_loss_weight * x0_l1
+                loss_terms["loss/x0_l1"] = x0_l1.detach() / float(x_start.numel())
+            if self.roi_mean_loss_weight > 0.0:
+                roi_mean = roi_mean_consistency_sum(x0_hat, x_start, mask=mask)
+                loss = loss + self.roi_mean_loss_weight * roi_mean
+                loss_terms["loss/roi_mean"] = roi_mean.detach() / float(x_start.numel())
+            if self.grad_loss_weight > 0.0:
+                grad_loss = gradient_l1_sum(x0_hat, x_start, mask=mask)
+                loss = loss + self.grad_loss_weight * grad_loss
+                loss_terms["loss/grad"] = grad_loss.detach() / float(x_start.numel())
+            if self.freq_x0_loss_weight > 0.0:
+                freq_x0 = frequency_l1_sum(x0_hat, x_start, mask=mask)
+                loss = loss + self.freq_x0_loss_weight * freq_x0
+                loss_terms["loss/freq_x0"] = freq_x0.detach() / float(x_start.numel())
+            if self.degradation_loss_weight > 0.0 and 'LR' in x_in:
+                lowres = x_in.get('LOWRES', None)
+                deg_loss = degradation_l1_sum(
+                    x0_hat,
+                    x_in['LR'],
+                    lowres_half=lowres,
+                    mask=mask,
+                    window=self.degradation_window,
+                )
+                loss = loss + self.degradation_loss_weight * deg_loss
+                loss_terms["loss/degradation"] = deg_loss.detach() / float(x_start.numel())
+
+        self.last_loss_dict = {
+            key: float(val.item() if torch.is_tensor(val) else val)
+            for key, val in loss_terms.items()
+        }
+        # DataParallel warns when every replica returns a scalar; keeping a
+        # length-1 tensor preserves the existing sum() reduction downstream.
+        return loss.view(1)
 
     def forward(self, x, *args, **kwargs):
         return self.p_losses(x, *args, **kwargs)

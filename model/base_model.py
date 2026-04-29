@@ -32,16 +32,19 @@ class BaseModel():
         pass
 
     def set_device(self, x):
+        if torch.is_tensor(x):
+            return x.to(self.device)
         if isinstance(x, dict):
             for key, item in x.items():
-                if item is not None:
-                    x[key] = item.to(self.device)
+                x[key] = self.set_device(item)
         elif isinstance(x, list):
             for i, item in enumerate(x):
-                if item is not None:
-                    x[i] = item.to(self.device)
+                x[i] = self.set_device(item)
+        elif isinstance(x, tuple):
+            x = tuple(self.set_device(item) for item in x)
         else:
-            x = x.to(self.device)
+            # Keep metadata such as strings/ints/lists from DataLoader on CPU.
+            return x
         return x
 
     def get_network_description(self, network):
