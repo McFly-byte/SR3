@@ -132,18 +132,69 @@ dmypy.json
 # IDE and local settings
 .cursor/
 .vscode/
+.idea/
+*.code-workspace
+
+# Documentation and reports
+README*
+*.md
+*.rst
+*.txt
+!requirement.txt
+*.doc
+*.docx
+*.pdf
+*.ppt
+*.pptx
+*.xls
+*.xlsx
+docs/
+doc/
+documentation/
+reports/
+report/
+paper_material/
+
+# Config files
+config/
+configs/
+*.json
+*.yaml
+*.yml
+*.toml
+*.ini
+*.cfg
+
+# Data directories and generated inference outputs
+dataset/
+datasets/
+dataset_mrsi/
+SR3_INFERENCE_DATA/
+data/raw/
+data/interim/
+data/processed/
+data/external/
+data/cache/
 
 # Large experiment outputs
-experiments/*
-!experiments/*/config.json
-!experiments/*/graph/
-
-# Generated MRSI datasets and visual checks (large/local)
-dataset_mrsi/*
-!dataset_mrsi/mrsi_sr3_64_smoke/
-!dataset_mrsi/mrsi_sr3_64_smoke/**
+experiments/
+results/
+outputs/
+graph/
+logs/
+runs/
+wandb/
 
 # Scientific data artifacts
+*.csv
+*.tsv
+*.png
+*.jpg
+*.jpeg
+*.tif
+*.tiff
+*.bmp
+*.gif
 *.nii
 *.nii.gz
 *.npy
@@ -152,6 +203,28 @@ dataset_mrsi/*
 *.h5
 *.hdf5
 *.lmdb
+*.dcm
+*.mha
+*.mhd
+*.raw
+
+# Model weights and serialized parameters
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+*.onnx
+*.pb
+*.pkl
+*.pickle
+*.joblib
+*.bin
+checkpoints/
+checkpoint/
+weights/
+pretrained/
+pretrained_models/
+model_params/
 
 # Generated dataset manifests / local visual inspection outputs
 dataset_mrsi/**/run_config.json

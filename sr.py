@@ -31,6 +31,10 @@ try:
 except Exception:
     from torch.utils.tensorboard import SummaryWriter
 import numpy as np
+try:
+    from tqdm.auto import tqdm
+except Exception:
+    tqdm = None
 
 try:
     import lpips
@@ -277,6 +281,10 @@ if __name__ == "__main__":
     torch.backends.cudnn.enabled = True
     torch.backends.cudnn.benchmark = bool(train_opt.get('cudnn_benchmark', not deterministic))
     torch.backends.cudnn.deterministic = bool(train_opt.get('cudnn_deterministic', deterministic))
+    allow_tf32 = bool(train_opt.get('allow_tf32', True))
+    if torch.cuda.is_available():
+        torch.backends.cuda.matmul.allow_tf32 = allow_tf32
+        torch.backends.cudnn.allow_tf32 = allow_tf32
 
     logger = logging.getLogger('base')
     logger_val = logging.getLogger('val')
@@ -330,6 +338,11 @@ if __name__ == "__main__":
     diffusion.set_new_noise_schedule(
         opt['model']['beta_schedule'][opt['phase']], schedule_phase=opt['phase'])
     if opt['phase'] == 'train':
+        pbar = None
+        progress_bar_refresh = max(1, int(opt.get('train', {}).get('progress_bar_refresh', 10) or 10))
+        progress_bar_mininterval = float(opt.get('train', {}).get('progress_bar_mininterval', 5.0) or 5.0)
+        if opt.get('is_main_process', True) and tqdm is not None and bool(opt.get('train', {}).get('progress_bar', True)):
+            pbar = tqdm(total=n_iter, initial=current_step, dynamic_ncols=True, mininterval=progress_bar_mininterval, desc='train')
         while current_step < n_iter:
             current_epoch += 1
             if hasattr(train_loader, 'sampler') and hasattr(train_loader.sampler, 'set_epoch'):
@@ -340,7 +353,19 @@ if __name__ == "__main__":
                     break
                 diffusion.current_step = current_step
                 diffusion.feed_data(train_data)
-                diffusion.optimize_parameters()
+                optimize_ok = diffusion.optimize_parameters()
+                if pbar is not None:
+                    pbar.update(1)
+                    if current_step % progress_bar_refresh == 0 or current_step == n_iter:
+                        logs_for_bar = diffusion.get_current_log()
+                        postfix = {'epoch': current_epoch}
+                        for key in ('l_pix', 'grad_norm', 'skipped_step'):
+                            if key in logs_for_bar:
+                                try:
+                                    postfix[key] = '{:.3g}'.format(float(logs_for_bar[key]))
+                                except Exception:
+                                    postfix[key] = logs_for_bar[key]
+                        pbar.set_postfix(postfix, refresh=False)
                 # log
                 if current_step % opt['train']['print_freq'] == 0:
                     logs = _reduce_log_dict(diffusion.get_current_log())
@@ -381,7 +406,14 @@ if __name__ == "__main__":
                                                      ['results'], current_epoch)
                         os.makedirs(result_path, exist_ok=True)
                         val_max_samples = int(opt['train'].get('val_max_samples', -1))
-                        frc_apodize = bool(opt.get('metrics', {}).get('frc_apodize', True))
+                        metrics_opt = opt.get('metrics', {}) or {}
+                        val_opt = opt.get('validation', {}) or {}
+                        frc_apodize = bool(metrics_opt.get('frc_apodize', True))
+                        enable_hfen = bool(metrics_opt.get('enable_hfen', True))
+                        enable_frc = bool(metrics_opt.get('enable_frc', True))
+                        enable_dmi_metrics = bool(metrics_opt.get('enable_dmi_metrics', True))
+                        val_sample_steps = int(val_opt.get('sample_num_steps', 0) or 0)
+                        save_image_count = int(val_opt.get('save_image_count', -1))
 
                         diffusion.set_new_noise_schedule(
                             opt['model']['beta_schedule']['val'], schedule_phase='val')
@@ -397,7 +429,10 @@ if __name__ == "__main__":
                             split_name = _as_scalar(val_data, 'SPLIT', 'val')
                             met_name = _as_scalar(val_data, 'MET_NAME', str(met_id))
                             diffusion.feed_data(val_data)
-                            diffusion.test(continous=False)
+                            diffusion.test(
+                                continous=False,
+                                sample_num_steps=(val_sample_steps if val_sample_steps > 0 else None),
+                            )
                             visuals = diffusion.get_current_visuals()
 
                             sr_t = visuals['SR']
@@ -412,30 +447,37 @@ if __name__ == "__main__":
                             sr_img = Metrics.tensor2img(sr_t)  # uint8
                             hr_img = Metrics.tensor2img(visuals['HR'])  # uint8
                             lr_img = Metrics.tensor2img(lr_t)  # uint8
-                            err_img = _error_map_img(sr_t, hr_t)
-
-                            Metrics.save_img(
-                                hr_img, '{}/{}_{}_hr.png'.format(result_path, current_step, idx))
-                            Metrics.save_img(
-                                sr_img, '{}/{}_{}_sr.png'.format(result_path, current_step, idx))
-                            Metrics.save_img(
-                                err_img, '{}/{}_{}_err.png'.format(result_path, current_step, idx))
-                            Metrics.save_img(
-                                lr_img, '{}/{}_{}_lr.png'.format(result_path, current_step, idx))
-                            Metrics.save_img(
-                                lr_img, '{}/{}_{}_inf.png'.format(result_path, current_step, idx))
-                            tb_logger.add_image(
-                                'Iter_{}'.format(current_step),
-                                _concat_for_tb(lr_img, sr_img, hr_img),
-                                idx)
+                            if save_image_count < 0 or idx <= save_image_count:
+                                err_img = _error_map_img(sr_t, hr_t)
+                                Metrics.save_img(
+                                    hr_img, '{}/{}_{}_hr.png'.format(result_path, current_step, idx))
+                                Metrics.save_img(
+                                    sr_img, '{}/{}_{}_sr.png'.format(result_path, current_step, idx))
+                                Metrics.save_img(
+                                    err_img, '{}/{}_{}_err.png'.format(result_path, current_step, idx))
+                                Metrics.save_img(
+                                    lr_img, '{}/{}_{}_lr.png'.format(result_path, current_step, idx))
+                                Metrics.save_img(
+                                    lr_img, '{}/{}_{}_inf.png'.format(result_path, current_step, idx))
+                                tb_logger.add_image(
+                                    'Iter_{}'.format(current_step),
+                                    _concat_for_tb(lr_img, sr_img, hr_img),
+                                    idx)
 
                             eval_psnr = Metrics.calculate_psnr(sr_img, hr_img)
                             eval_ssim = Metrics.calculate_ssim(sr_img, hr_img)
                             eval_masked_ssim = _masked_ssim_from_imgs(sr_img, hr_img, mask_t)
                             eval_lpips = _compute_lpips(lpips_model, sr_t, hr_t, mask_t=mask_t)
-                            eval_hfen = _compute_hfen(sr_t, hr_t, mask_t=mask_t)
-                            eval_frc_auc, eval_frc_hf, eval_frc_cut = _compute_frc(sr_t, hr_t, mask_t=mask_t, apodize=frc_apodize)
-                            dmi_metrics = _compute_dmi_metrics(sr_t, hr_t, lr_t, mask_t, lowres)
+                            eval_hfen = _compute_hfen(sr_t, hr_t, mask_t=mask_t) if enable_hfen else None
+                            if enable_frc:
+                                eval_frc_auc, eval_frc_hf, eval_frc_cut = _compute_frc(
+                                    sr_t, hr_t, mask_t=mask_t, apodize=frc_apodize)
+                            else:
+                                eval_frc_auc, eval_frc_hf, eval_frc_cut = None, None, None
+                            dmi_metrics = (
+                                _compute_dmi_metrics(sr_t, hr_t, lr_t, mask_t, lowres)
+                                if enable_dmi_metrics else {}
+                            )
                             if eval_masked_ssim is not None:
                                 dmi_metrics['masked_ssim'] = eval_masked_ssim
 
@@ -565,6 +607,8 @@ if __name__ == "__main__":
             if wandb_logger and opt.get('is_main_process', True):
                 wandb_logger.log_metrics({'epoch': current_epoch-1})
 
+        if pbar is not None:
+            pbar.close()
         # save model
         if opt.get('is_main_process', True):
             logger.info('End of training.')

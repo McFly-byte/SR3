@@ -33,6 +33,12 @@ class DDPM(BaseModel):
         self.set_new_noise_schedule(
             opt['model']['beta_schedule']['train'], schedule_phase='train')
         self.grad_clip_norm = float(opt.get('train', {}).get('grad_clip_norm', 0.0) or 0.0)
+        train_cfg = opt.get('train', {}) or {}
+        amp_cfg = train_cfg.get('amp', {}) or {}
+        self.use_amp = bool(train_cfg.get('use_amp', amp_cfg.get('enabled', False))) and self.device.type == 'cuda'
+        amp_dtype_name = str(amp_cfg.get('dtype', train_cfg.get('amp_dtype', 'float16'))).lower()
+        self.amp_dtype = torch.bfloat16 if amp_dtype_name in ('bf16', 'bfloat16') else torch.float16
+        self.scaler = torch.amp.GradScaler('cuda', enabled=bool(self.use_amp and self.amp_dtype is torch.float16))
         ema_cfg = opt.get('train', {}).get('ema_scheduler', {}) or {}
         self.use_ema = bool(ema_cfg)
         self.step_start_ema = int(ema_cfg.get('step_start_ema', 0) or 0)
@@ -70,11 +76,13 @@ class DDPM(BaseModel):
         self.data = self.set_device(data)
 
     def optimize_parameters(self):
-        self.optG.zero_grad()
-        l_pix = self.netG(self.data)
-        # need to average in multi-gpu
-        b, c, h, w = self.data['HR'].shape
-        l_pix = l_pix.sum() / int(b * c * h * w)
+        self.optG.zero_grad(set_to_none=True)
+        autocast_enabled = bool(self.use_amp and self.device.type == 'cuda')
+        with torch.amp.autocast('cuda', dtype=self.amp_dtype, enabled=autocast_enabled):
+            l_pix = self.netG(self.data)
+            # need to average in multi-gpu
+            b, c, h, w = self.data['HR'].shape
+            l_pix = l_pix.sum() / int(b * c * h * w)
         if not torch.isfinite(l_pix):
             logger.warning('Non-finite training loss detected; skip optimizer step.')
             self.log_dict['l_pix'] = float('nan')
@@ -83,29 +91,46 @@ class DDPM(BaseModel):
                 self.log_dict['grad_norm'] = float('nan')
             return False
 
-        l_pix.backward()
-        if self.grad_clip_norm > 0:
-            grad_norm = torch.nn.utils.clip_grad_norm_(self.netG.parameters(), max_norm=self.grad_clip_norm)
-            grad_norm_val = float(grad_norm.item() if torch.is_tensor(grad_norm) else grad_norm)
-            self.log_dict['grad_norm'] = grad_norm_val
-            if not math.isfinite(grad_norm_val):
-                logger.warning('Non-finite gradient norm detected after clipping; skip optimizer step.')
-                self.optG.zero_grad()
-                self.log_dict['l_pix'] = float('nan')
-                self.log_dict['skipped_step'] = 1.0
-                return False
-        self.optG.step()
+        if self.scaler.is_enabled():
+            self.scaler.scale(l_pix).backward()
+            if self.grad_clip_norm > 0:
+                self.scaler.unscale_(self.optG)
+                grad_norm = torch.nn.utils.clip_grad_norm_(self.netG.parameters(), max_norm=self.grad_clip_norm)
+                grad_norm_val = float(grad_norm.item() if torch.is_tensor(grad_norm) else grad_norm)
+                self.log_dict['grad_norm'] = grad_norm_val
+                if not math.isfinite(grad_norm_val):
+                    logger.warning('Non-finite gradient norm detected after clipping; skip optimizer step.')
+                    self.optG.zero_grad(set_to_none=True)
+                    self.scaler.update()
+                    self.log_dict['l_pix'] = float('nan')
+                    self.log_dict['skipped_step'] = 1.0
+                    return False
+            self.scaler.step(self.optG)
+            self.scaler.update()
+        else:
+            l_pix.backward()
+            if self.grad_clip_norm > 0:
+                grad_norm = torch.nn.utils.clip_grad_norm_(self.netG.parameters(), max_norm=self.grad_clip_norm)
+                grad_norm_val = float(grad_norm.item() if torch.is_tensor(grad_norm) else grad_norm)
+                self.log_dict['grad_norm'] = grad_norm_val
+                if not math.isfinite(grad_norm_val):
+                    logger.warning('Non-finite gradient norm detected after clipping; skip optimizer step.')
+                    self.optG.zero_grad(set_to_none=True)
+                    self.log_dict['l_pix'] = float('nan')
+                    self.log_dict['skipped_step'] = 1.0
+                    return False
+            self.optG.step()
         if self.use_ema and (getattr(self, 'current_step', 0) % self.update_ema_every == 0):
             self.update_ema()
 
         # set log
-        self.log_dict['l_pix'] = l_pix.item()
+        self.log_dict['l_pix'] = float(l_pix.detach().float().item())
+        self.log_dict['amp_enabled'] = 1.0 if self.use_amp else 0.0
         net = _unwrap_module(self.netG)
         for key, value in getattr(net, 'last_loss_dict', {}).items():
             self.log_dict[key] = float(value)
         self.log_dict['skipped_step'] = 0.0
         return True
-
     def _get_eval_network(self):
         if self.netG_EMA is not None:
             return self.netG_EMA

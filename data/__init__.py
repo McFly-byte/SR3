@@ -29,16 +29,27 @@ def create_dataloader(dataset, dataset_opt, phase):
     else:
         batch_size = dataset_opt.get('batch_size', 1)
     if phase == 'train':
-        return torch.utils.data.DataLoader(
-            dataset,
+        num_workers = int(dataset_opt.get('num_workers', 0))
+        loader_kwargs = dict(
             batch_size=batch_size,
             shuffle=(sampler is None and dataset_opt['use_shuffle']),
             sampler=sampler,
-            num_workers=dataset_opt['num_workers'],
-            pin_memory=True)
+            num_workers=num_workers,
+            pin_memory=True,
+        )
+        if num_workers > 0:
+            loader_kwargs['persistent_workers'] = bool(dataset_opt.get('persistent_workers', False))
+            if 'prefetch_factor' in dataset_opt:
+                loader_kwargs['prefetch_factor'] = int(dataset_opt.get('prefetch_factor', 2))
+        return torch.utils.data.DataLoader(dataset, **loader_kwargs)
     elif phase in ['val', 'test']:
-        return torch.utils.data.DataLoader(
-            dataset, batch_size=1, shuffle=False, num_workers=1, pin_memory=True)
+        num_workers = int(dataset_opt.get('val_num_workers', 1))
+        loader_kwargs = dict(batch_size=1, shuffle=False, num_workers=num_workers, pin_memory=True)
+        if num_workers > 0:
+            loader_kwargs['persistent_workers'] = bool(dataset_opt.get('val_persistent_workers', False))
+            if 'val_prefetch_factor' in dataset_opt:
+                loader_kwargs['prefetch_factor'] = int(dataset_opt.get('val_prefetch_factor', 2))
+        return torch.utils.data.DataLoader(dataset, **loader_kwargs)
     else:
         raise NotImplementedError(
             'Dataloader [{:s}] is not found.'.format(phase))

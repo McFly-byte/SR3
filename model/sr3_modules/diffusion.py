@@ -456,8 +456,8 @@ class GaussianDiffusion(nn.Module):
 
     def _freq_loss(self, noise_target, noise_pred):
         """Frequency-domain L1 loss on the 2-D FFT magnitude spectrum."""
-        fft_target = torch.fft.rfft2(noise_target, norm='ortho')
-        fft_pred = torch.fft.rfft2(noise_pred, norm='ortho')
+        fft_target = torch.fft.rfft2(noise_target.float(), norm='ortho')
+        fft_pred = torch.fft.rfft2(noise_pred.float(), norm='ortho')
         mag_target = torch.abs(fft_target)
         mag_pred = torch.abs(fft_pred)
         return F.l1_loss(mag_pred, mag_target, reduction='sum')

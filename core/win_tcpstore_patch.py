@@ -1,6 +1,11 @@
-"""Windows 官方 PyTorch wheel 常无 libuv；TCPStore 默认仍会走 libuv 路径。
+﻿"""Windows TCPStore helper for PyTorch builds without libuv support.
 
-rendezvous 在 import 时已绑定 TCPStore，必须在各模块命名空间上替换 TCPStore 符号。"""
+Some Windows PyTorch wheels default to libuv-backed TCPStore even though they
+were built without libuv. Patch every module-level TCPStore binding used by
+``torchrun`` and ``init_process_group(env://)`` so DDP can start with the
+classic TCPStore implementation.
+"""
+import importlib
 import os
 
 
@@ -9,8 +14,7 @@ def apply_tcpstore_no_libuv_patch():
         return
     try:
         import torch.distributed as dist
-        import torch.distributed.rendezvous as rdzv
-        _real = dist.TCPStore
+        real_tcp_store = dist.TCPStore
     except Exception:
         return
 
@@ -18,15 +22,23 @@ def apply_tcpstore_no_libuv_patch():
         kwargs = dict(kwargs)
         kwargs['use_libuv'] = False
         try:
-            return _real(*args, **kwargs)
+            return real_tcp_store(*args, **kwargs)
         except TypeError:
             kwargs.pop('use_libuv', None)
-            return _real(*args, **kwargs)
+            return real_tcp_store(*args, **kwargs)
 
     dist.TCPStore = _TCPStore_no_libuv
-    rdzv.TCPStore = _TCPStore_no_libuv
-    try:
-        import torch.distributed.elastic.rendezvous.static_tcp_rendezvous as stcp
-        stcp.TCPStore = _TCPStore_no_libuv
-    except Exception:
-        pass
+
+    module_names = [
+        'torch.distributed.rendezvous',
+        'torch.distributed.elastic.rendezvous.c10d_rendezvous_backend',
+        'torch.distributed.elastic.rendezvous.static_tcp_rendezvous',
+        'torch.distributed.elastic.rendezvous.dynamic_rendezvous',
+        'torch.distributed.elastic.utils.distributed',
+    ]
+    for module_name in module_names:
+        try:
+            module = importlib.import_module(module_name)
+            setattr(module, 'TCPStore', _TCPStore_no_libuv)
+        except Exception:
+            pass
