@@ -7,7 +7,7 @@
 典型用法（在仓库根目录执行）::
 
     python scripts/infer_best_mrsi_compare.py \\
-        --run_dir experiments/sr3_mrsi_64_mvp_260428_231833 \\
+        --run_dir experiments/models/healthy_phantom_i300000_ema \\
         --config config/sr3_mrsi_64_mvp.json \\
         --input_npz dataset_mrsi/mrsi_sr3_64/val/data/xxx.npz \\
         --output compare.png
@@ -50,9 +50,23 @@ os.chdir(_REPO_ROOT)
 import core.logger as Logger  # noqa: E402
 import model as Model  # noqa: E402
 import core.metrics as Metrics  # noqa: E402
+from core.dmi_visualization import (  # noqa: E402
+    DEFAULT_PERCENTILES,
+    DEFAULT_ROTATE_K,
+    orient_for_display,
+    robust_display_limits,
+    signed_error_limit,
+    validate_percentiles,
+)
+from core.quantitative_normalization import (  # noqa: E402
+    denormalize_quantity,
+    load_normalization_contract,
+    normalize_quantity,
+)
 
 _METRICS_STEM_RE = re.compile(r"^(?P<iter>\d+)_metrics$", re.IGNORECASE)
 _CKPT_GEN_RE = re.compile(r"^I(?P<it>\d+)_E(?P<ep>\d+)_gen\.pth$", re.IGNORECASE)
+_MET_TO_ID = {"HDO": 0, "Glc": 1, "Glx": 2, "Lac": 3}
 
 
 def _load_json_config(path: Path) -> OrderedDict:
@@ -180,23 +194,19 @@ def _to_minus1_1(x: torch.Tensor) -> torch.Tensor:
 
 
 def _load_image_or_npy(path: Path) -> np.ndarray:
-    """返回 2D float32 数组，值域约 [0,1]（按数据 min-max 若超出则先 min-max）。"""
+    """Load a raw 2-D matrix without data-dependent min-max normalization."""
     suf = path.suffix.lower()
     if suf == ".npy":
         arr = np.load(str(path)).astype(np.float32)
     else:
         from PIL import Image
 
-        arr = np.array(Image.open(path).convert("L"), dtype=np.float32)
+        arr = np.array(Image.open(path).convert("L"), dtype=np.float32) / 255.0
     if arr.ndim != 2:
         raise ValueError(f"{path} 期望 2D 灰度或 .npy 二维数组，得到 shape={arr.shape}")
-    arr_min = float(np.min(arr))
-    arr_max = float(np.max(arr))
-    if arr_max <= 1.0 + 1e-3 and arr_min >= -1e-3:
-        return np.clip(arr, 0.0, 1.0)
-    if arr_max - arr_min < 1e-8:
-        return np.zeros_like(arr, dtype=np.float32)
-    return ((arr - arr_min) / (arr_max - arr_min)).astype(np.float32)
+    if not np.all(np.isfinite(arr)):
+        raise ValueError(f"{path} contains non-finite values")
+    return arr.astype(np.float32, copy=False)
 
 
 def _resize_hw01(x2d: np.ndarray, size: int) -> torch.Tensor:
@@ -238,12 +248,32 @@ def _batch_from_npz(npz_path: Path, device: torch.device, ds_opt: Dict[str, Any]
     flair = torch.from_numpy(data["flair"]).float().unsqueeze(0)
     met_onehot = torch.from_numpy(data["met_onehot"]).float().unsqueeze(0)
     mask = torch.from_numpy(data["mask"]).float().unsqueeze(0)
+    lr_matrix = int(np.asarray(data["lr_matrix"]).item()) if "lr_matrix" in data.files else int(np.asarray(data["lowres"]).item()) * 2
+    lr_native_padded = torch.zeros_like(hr)
+    has_native_lr = int("lr_native" in data.files)
+    if has_native_lr:
+        native = torch.from_numpy(data["lr_native"]).float().unsqueeze(0)
+        n = int(native.shape[-1])
+        y0 = int(hr.shape[-2]) // 2 - n // 2
+        x0 = int(hr.shape[-1]) // 2 - n // 2
+        lr_native_padded[..., y0 : y0 + n, x0 : x0 + n] = native
     cond = _stack_condition_from_parts(lr, t1, flair, met_onehot, mask, ds_opt)
     out: Dict[str, Any] = {
         "HR": _to_minus1_1(hr),
         "SR": _to_minus1_1(cond),
         "LR": _to_minus1_1(lr),
         "MASK": mask,
+        "LR_NATIVE": lr_native_padded,
+        "LR_MATRIX": torch.tensor(lr_matrix),
+        "HAS_NATIVE_LR": torch.tensor(float(has_native_lr)),
+        "NORMALIZATION_SCALE": torch.tensor(
+            float(np.asarray(data["normalization_scale"]).item())
+            if "normalization_scale" in data.files else 1.0
+        ),
+        "QUANTITY_UNIT": (
+            str(np.asarray(data["quantity_unit"]).item())
+            if "quantity_unit" in data.files else "simulation_arbitrary_unit"
+        ),
     }
     for k, v in out.items():
         if torch.is_tensor(v):
@@ -251,13 +281,16 @@ def _batch_from_npz(npz_path: Path, device: torch.device, ds_opt: Dict[str, Any]
     return out
 
 
-def _norm_minmax_01(arr: np.ndarray) -> np.ndarray:
-    """物理数值矩阵 → [0,1] float32（逐幅 min-max）。"""
+def _as_normalized_01(arr: np.ndarray, *, scale: float, input_normalized: bool) -> np.ndarray:
     a = np.asarray(arr, dtype=np.float32)
-    lo, hi = float(np.min(a)), float(np.max(a))
-    if hi - lo < 1e-12:
-        return np.zeros_like(a, dtype=np.float32)
-    return ((a - lo) / (hi - lo)).astype(np.float32)
+    if input_normalized:
+        lo, hi = float(np.min(a)), float(np.max(a))
+        if lo < -1.0e-4 or hi > 1.0001:
+            raise ValueError(
+                f"--input_normalized was set but values span [{lo:.6g}, {hi:.6g}], outside [0,1]"
+            )
+        return np.clip(a, 0.0, 1.0).astype(np.float32, copy=False)
+    return normalize_quantity(a, scale, clip=True)
 
 
 def _batch_from_lr_hr_numpy(
@@ -266,26 +299,48 @@ def _batch_from_lr_hr_numpy(
     image_size: int,
     device: torch.device,
     ds_opt: Dict[str, Any],
+    *,
+    normalization_scale: float,
+    input_normalized: bool,
+    quantity_unit: str,
+    met_id: int,
 ) -> Dict[str, Any]:
-    """与 ``_batch_from_lr_hr_images`` 相同逻辑，输入已为二维物理或 [0,1] 数组。"""
+    """Build a batch using a shared reversible scale for LR and HR."""
     if lr_np.ndim != 2 or hr_np.ndim != 2:
         raise ValueError(f"LR/HR 须为二维数组，得到 lr={lr_np.shape}, hr={hr_np.shape}")
-    lr_u8 = _norm_minmax_01(lr_np)
-    hr_u8 = _norm_minmax_01(hr_np)
-    lr = _resize_hw01(lr_u8, image_size)
-    hr = _resize_hw01(hr_u8, image_size)
+    lr_01 = _as_normalized_01(lr_np, scale=normalization_scale, input_normalized=input_normalized)
+    hr_01 = _as_normalized_01(hr_np, scale=normalization_scale, input_normalized=input_normalized)
+    lr = _resize_hw01(lr_01, image_size)
+    hr = _resize_hw01(hr_01, image_size)
     t1 = lr.clone()
     flair = lr.clone()
     _, _, h, w = lr.shape
     met = torch.zeros(1, 4, h, w, device=lr.device, dtype=lr.dtype)
-    met[:, 0, :, :] = 1.0
+    if met_id < 0 or met_id >= 4:
+        raise ValueError(f"met_id must be in [0,3], got {met_id}")
+    met[:, met_id, :, :] = 1.0
     mask = torch.ones_like(lr)
     cond = _stack_condition_from_parts(lr, t1, flair, met, mask, ds_opt)
+    native = torch.from_numpy(lr_01).float().view(1, 1, *lr_01.shape)
+    native_padded = torch.zeros_like(lr)
+    native_h, native_w = int(native.shape[-2]), int(native.shape[-1])
+    if native_h > image_size or native_w > image_size:
+        raise ValueError(
+            f"Native LR shape {(native_h, native_w)} exceeds model image_size={image_size}"
+        )
+    y0, x0 = image_size // 2 - native_h // 2, image_size // 2 - native_w // 2
+    native_padded[..., y0 : y0 + native_h, x0 : x0 + native_w] = native
     return {
         "HR": _to_minus1_1(hr).to(device),
         "SR": _to_minus1_1(cond).to(device),
         "LR": _to_minus1_1(lr).to(device),
         "MASK": mask.to(device),
+        "LR_NATIVE": native_padded.to(device),
+        "LR_MATRIX": torch.tensor(native_h, device=device),
+        "HAS_NATIVE_LR": torch.tensor(1.0, device=device),
+        "NORMALIZATION_SCALE": torch.tensor(float(normalization_scale), device=device),
+        "QUANTITY_UNIT": str(quantity_unit),
+        "MET_ID": int(met_id),
     }
 
 
@@ -295,10 +350,25 @@ def _batch_from_lr_hr_images(
     image_size: int,
     device: torch.device,
     ds_opt: Dict[str, Any],
+    *,
+    normalization_scale: float,
+    input_normalized: bool,
+    quantity_unit: str,
+    met_id: int,
 ) -> Dict[str, Any]:
     lr_np = _load_image_or_npy(lr_path)
     hr_np = _load_image_or_npy(hr_path)
-    return _batch_from_lr_hr_numpy(lr_np, hr_np, image_size, device, ds_opt)
+    return _batch_from_lr_hr_numpy(
+        lr_np,
+        hr_np,
+        image_size,
+        device,
+        ds_opt,
+        normalization_scale=normalization_scale,
+        input_normalized=input_normalized,
+        quantity_unit=quantity_unit,
+        met_id=met_id,
+    )
 
 
 def _tensor01_for_plot(t: torch.Tensor) -> np.ndarray:
@@ -316,18 +386,45 @@ def _save_triplet_figure(
     title: str,
     cmap: str,
     dpi: float,
+    rotate_k: int = DEFAULT_ROTATE_K,
+    percentiles: Tuple[float, float] = DEFAULT_PERCENTILES,
+    include_error: bool = True,
     panel_labels: Tuple[str, str, str] = ("LR", "SR", "HR"),
+    colorbar_label: str = "quantity",
 ) -> None:
-    vmin = float(min(lr01.min(), sr01.min(), hr01.min()))
-    vmax = float(max(lr01.max(), sr01.max(), hr01.max()))
-    fig, axes = plt.subplots(1, 3, figsize=(12, 3.8), constrained_layout=True)
-    for ax, arr, lab in zip(axes, (lr01, sr01, hr01), panel_labels):
-        im = ax.imshow(arr, cmap=cmap, vmin=vmin, vmax=vmax, interpolation="nearest")
+    vmin, vmax = robust_display_limits(
+        (lr01, sr01, hr01), reference=hr01, percentiles=percentiles
+    )
+    ncols = 4 if include_error else 3
+    fig, axes = plt.subplots(1, ncols, figsize=(4.0 * ncols, 3.8), constrained_layout=True)
+    main_axes = axes[:3]
+    for ax, arr, lab in zip(main_axes, (lr01, sr01, hr01), panel_labels):
+        im = ax.imshow(
+            orient_for_display(arr, rotate_k),
+            cmap=cmap,
+            vmin=vmin,
+            vmax=vmax,
+            interpolation="nearest",
+        )
         ax.set_title(lab)
         ax.set_xticks([])
         ax.set_yticks([])
+    if include_error:
+        difference = sr01 - hr01
+        dlim = signed_error_limit(difference, reference=hr01, percentile=percentiles[1])
+        err_im = axes[3].imshow(
+            orient_for_display(difference, rotate_k),
+            cmap="coolwarm",
+            vmin=-dlim,
+            vmax=dlim,
+            interpolation="nearest",
+        )
+        axes[3].set_title("SR - HR")
+        axes[3].set_xticks([])
+        axes[3].set_yticks([])
+        fig.colorbar(err_im, ax=axes[3], shrink=0.82, label=f"signed error ({colorbar_label})")
     fig.suptitle(title, fontsize=11)
-    fig.colorbar(im, ax=axes.ravel().tolist(), shrink=0.82, label="[0,1] 归一化幅度")
+    fig.colorbar(im, ax=main_axes.ravel().tolist(), shrink=0.82, label=colorbar_label)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(out_path, dpi=dpi)
     plt.close(fig)
@@ -345,6 +442,25 @@ def main() -> None:
     )
     parser.add_argument("--lr", type=str, default=None, help="低分图路径（与 --hr 联用）")
     parser.add_argument("--hr", type=str, default=None, help="真值 HR 图路径（与 --lr 联用）")
+    parser.add_argument(
+        "--normalization_contract",
+        type=str,
+        default=None,
+        help="定量数据集 summary JSON；用于按代谢物读取可逆固定尺度",
+    )
+    parser.add_argument("--metabolite", choices=tuple(_MET_TO_ID), default="HDO")
+    parser.add_argument(
+        "--normalization_scale",
+        type=float,
+        default=None,
+        help="物理值除以该固定尺度；优先级高于 contract",
+    )
+    parser.add_argument(
+        "--input_normalized",
+        action="store_true",
+        help="声明 --lr/--hr 已用同一固定尺度归一化到 [0,1]",
+    )
+    parser.add_argument("--quantity_unit", type=str, default=None, help="数值输出与 colorbar 的单位")
     parser.add_argument(
         "--checkpoint_prefix",
         type=str,
@@ -366,9 +482,27 @@ def main() -> None:
         default=None,
         help="覆盖配置中的 DDIM 步数；默认读 validation.sample_num_steps 或 model.diffusion",
     )
-    parser.add_argument("--cmap", type=str, default="turbo", help="matplotlib 色图名")
+    parser.add_argument(
+        "--cmap", type=str, default="viridis", help="代谢图色图（默认 viridis，与仿真预览一致）"
+    )
+    parser.add_argument(
+        "--percentiles", type=float, nargs=2, default=DEFAULT_PERCENTILES,
+        metavar=("LOW", "HIGH"), help="脑区稳健显示窗百分位（默认 1 99）"
+    )
+    parser.add_argument(
+        "--rotate_k", type=int, choices=(0, 1, 2, 3), default=DEFAULT_ROTATE_K,
+        help="逆时针旋转 90 度的次数（默认 1）"
+    )
+    parser.add_argument("--no_error", action="store_true", help="不显示 SR-HR 有符号误差列")
     parser.add_argument("--dpi", type=float, default=150.0)
+    parser.add_argument(
+        "--numeric_output",
+        type=str,
+        default=None,
+        help="浮点结果 .npz；默认与 --output 同目录并添加 _quantitative 后缀",
+    )
     args = parser.parse_args()
+    display_percentiles = validate_percentiles(args.percentiles)
 
     logging.basicConfig(level=logging.INFO, format="%(message)s")
     log = logging.getLogger("infer_compare")
@@ -392,7 +526,7 @@ def main() -> None:
 
     if args.checkpoint_prefix:
         resume_prefix = args.checkpoint_prefix
-        ckpt_msg = "使用用户指定 --checkpoint_prefix"
+        ckpt_msg = "specified checkpoint"
     else:
         resume_prefix, ckpt_msg = _select_checkpoint_prefix(run_dir, metrics_best_iter)
     log.info(ckpt_msg)
@@ -421,7 +555,35 @@ def main() -> None:
     if args.input_npz:
         batch = _batch_from_npz(Path(args.input_npz), dev, val_ds)
     elif args.lr and args.hr:
-        batch = _batch_from_lr_hr_images(Path(args.lr), Path(args.hr), image_size, dev, val_ds)
+        contract = None
+        if args.normalization_contract:
+            contract = load_normalization_contract(args.normalization_contract)
+        scale = args.normalization_scale
+        if scale is None and contract is not None:
+            scale = contract["normalization_scales"][args.metabolite]
+        if scale is None:
+            if args.input_normalized:
+                scale = 1.0
+            else:
+                raise SystemExit(
+                    "定量输入禁止逐图 min-max。请提供 --normalization_contract 或 "
+                    "--normalization_scale；若输入已归一化，请显式加 --input_normalized。"
+                )
+        quantity_unit = args.quantity_unit
+        if quantity_unit is None and contract is not None:
+            quantity_unit = contract["quantity_unit"]
+        quantity_unit = quantity_unit or ("normalized_unit" if args.input_normalized and scale == 1.0 else "quantity_unit")
+        batch = _batch_from_lr_hr_images(
+            Path(args.lr),
+            Path(args.hr),
+            image_size,
+            dev,
+            val_ds,
+            normalization_scale=float(scale),
+            input_normalized=bool(args.input_normalized),
+            quantity_unit=quantity_unit,
+            met_id=_MET_TO_ID[args.metabolite],
+        )
     else:
         raise SystemExit("请提供 --input_npz，或同时提供 --lr 与 --hr。")
 
@@ -435,14 +597,55 @@ def main() -> None:
     lr01 = _tensor01_for_plot(visuals["LR"])
     sr01 = _tensor01_for_plot(sr_t)
     hr01 = _tensor01_for_plot(visuals["HR"])
+    normalization_scale = float(batch["NORMALIZATION_SCALE"].detach().cpu().reshape(-1)[0].item())
+    quantity_unit_value = batch.get("QUANTITY_UNIT", "simulation_arbitrary_unit")
+    if isinstance(quantity_unit_value, (list, tuple)):
+        quantity_unit_value = quantity_unit_value[0]
+    quantity_unit = str(quantity_unit_value)
+    lr_quantity = denormalize_quantity(lr01, normalization_scale)
+    sr_quantity = denormalize_quantity(sr01, normalization_scale)
+    hr_quantity = denormalize_quantity(hr01, normalization_scale)
 
     out_path = Path(args.output)
     title_parts = [ckpt_msg]
     if metrics_note:
         title_parts.append(metrics_note)
     title = " | ".join(title_parts)
-    _save_triplet_figure(lr01, sr01, hr01, out_path, title=title, cmap=args.cmap, dpi=args.dpi)
+    _save_triplet_figure(
+        lr_quantity,
+        sr_quantity,
+        hr_quantity,
+        out_path,
+        title=title,
+        cmap=args.cmap,
+        dpi=args.dpi,
+        rotate_k=args.rotate_k,
+        percentiles=display_percentiles,
+        include_error=not args.no_error,
+        colorbar_label=quantity_unit,
+    )
+    numeric_path = (
+        Path(args.numeric_output)
+        if args.numeric_output
+        else out_path.with_name(f"{out_path.stem}_quantitative.npz")
+    )
+    numeric_path.parent.mkdir(parents=True, exist_ok=True)
+    np.savez_compressed(
+        numeric_path,
+        lr_normalized=lr01.astype(np.float32),
+        sr_normalized=sr01.astype(np.float32),
+        hr_normalized=hr01.astype(np.float32),
+        lr_quantity=lr_quantity,
+        sr_quantity=sr_quantity,
+        hr_quantity=hr_quantity,
+        normalization_scale=np.float32(normalization_scale),
+        quantity_unit=np.array(quantity_unit),
+        voxel_semantics=np.array("intensive"),
+        seed=np.int64(args.seed),
+        checkpoint_prefix=np.array(str(resume_prefix)),
+    )
     log.info("已保存: %s", out_path.resolve())
+    log.info("已保存浮点定量结果: %s", numeric_path.resolve())
 
 
 if __name__ == "__main__":

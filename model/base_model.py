@@ -32,6 +32,8 @@ class BaseModel():
         pass
 
     def set_device(self, x):
+        if isinstance(x, nn.Module):
+            return x.to(self.device)
         if torch.is_tensor(x):
             return x.to(self.device)
         if isinstance(x, dict):

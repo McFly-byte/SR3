@@ -38,6 +38,7 @@ class MRSISR3Dataset(Dataset):
         use_flair: bool = True,
         use_met_onehot: bool = True,
         use_mask_channel: bool = False,
+        use_native_lr_consistency: bool = False,
         strict_check: bool = False,
     ):
         self.split = split
@@ -48,6 +49,7 @@ class MRSISR3Dataset(Dataset):
         self.use_flair = bool(use_flair)
         self.use_met_onehot = bool(use_met_onehot)
         self.use_mask_channel = bool(use_mask_channel)
+        self.use_native_lr_consistency = bool(use_native_lr_consistency)
         self.strict_check = bool(strict_check)
         self.condition_layout = self._build_condition_layout()
 
@@ -125,6 +127,19 @@ class MRSISR3Dataset(Dataset):
         for key in ["hr", "lr", "t1", "flair", "mask", "met_onehot"]:
             self._check_range(key, data[key])
 
+        if "lr_native" in data.files:
+            lr_native_shape = tuple(data["lr_native"].shape)
+            lr_matrix = (
+                int(np.asarray(data["lr_matrix"]).item())
+                if "lr_matrix" in data.files else int(lr_native_shape[-1])
+            )
+            if lr_native_shape != (1, lr_matrix, lr_matrix):
+                raise ValueError(
+                    f"{npz_path}: lr_native must have shape (1,{lr_matrix},{lr_matrix}), "
+                    f"got {lr_native_shape}"
+                )
+            self._check_range("lr_native", data["lr_native"])
+
         met_sum = data["met_onehot"].sum(axis=0)
         if not np.allclose(met_sum, 1.0, atol=1e-4):
             raise ValueError(f"{npz_path}: met_onehot must sum to 1 at each pixel.")
@@ -143,7 +158,30 @@ class MRSISR3Dataset(Dataset):
         met_onehot = torch.from_numpy(data["met_onehot"]).float()
         mask = torch.from_numpy(data["mask"]).float()
 
-        hr, lr, t1, flair, met_onehot, mask = self._maybe_flip([hr, lr, t1, flair, met_onehot, mask])
+        hr_matrix = int(hr.shape[-1])
+        lr_matrix = int(np.asarray(data["lr_matrix"]).item()) if "lr_matrix" in data.files else int(data["lowres"]) * 2
+        has_native_lr = int("lr_native" in data.files)
+        if self.use_native_lr_consistency and not has_native_lr:
+            raise KeyError(
+                f"{npz_path} has no lr_native field, but use_native_lr_consistency=true. "
+                "Use the quantitative-v2 dataset or disable acquisition consistency."
+            )
+        lr_native_padded = torch.zeros_like(hr)
+        if has_native_lr:
+            lr_native = torch.from_numpy(data["lr_native"]).float()
+            native_h, native_w = int(lr_native.shape[-2]), int(lr_native.shape[-1])
+            if (native_h, native_w) != (lr_matrix, lr_matrix):
+                raise ValueError(
+                    f"{npz_path}: lr_native shape {(native_h, native_w)} does not match "
+                    f"lr_matrix={lr_matrix}"
+                )
+            y0 = hr_matrix // 2 - native_h // 2
+            x0 = int(hr.shape[-1]) // 2 - native_w // 2
+            lr_native_padded[:, y0 : y0 + native_h, x0 : x0 + native_w] = lr_native
+
+        hr, lr, t1, flair, met_onehot, mask, lr_native_padded = self._maybe_flip(
+            [hr, lr, t1, flair, met_onehot, mask, lr_native_padded]
+        )
 
         cond_tensors: List[torch.Tensor] = []
         if self.use_lr:
@@ -163,6 +201,27 @@ class MRSISR3Dataset(Dataset):
             "SR": _to_minus1_1(sr_cond),
             "LR": _to_minus1_1(lr),
             "MASK": mask,  # keep in 0~1 for frequency-domain metrics
+            "LR_NATIVE": lr_native_padded,
+            "HAS_NATIVE_LR": torch.tensor(has_native_lr, dtype=torch.float32),
+            "LR_MATRIX": torch.tensor(lr_matrix, dtype=torch.int64),
+            "HR_MATRIX": torch.tensor(hr_matrix, dtype=torch.int64),
+            "NORMALIZATION_SCALE": torch.tensor(
+                float(np.asarray(data["normalization_scale"]).item())
+                if "normalization_scale" in data.files else 1.0,
+                dtype=torch.float32,
+            ),
+            "QUANTITY_NAME": (
+                str(np.asarray(data["quantity_name"]).item())
+                if "quantity_name" in data.files else "concentration_like_signal"
+            ),
+            "QUANTITY_UNIT": (
+                str(np.asarray(data["quantity_unit"]).item())
+                if "quantity_unit" in data.files else "simulation_arbitrary_unit"
+            ),
+            "VOXEL_SEMANTICS": (
+                str(np.asarray(data["voxel_semantics"]).item())
+                if "voxel_semantics" in data.files else "intensive"
+            ),
             "Index": index,
             "SAMPLE_ID": int(rec.get("sample_id", index)),
             "SPLIT": rec.get("split", self.split),
@@ -174,5 +233,3 @@ class MRSISR3Dataset(Dataset):
             "LOWRES": int(data["lowres"]),
         }
         return out
-
-

@@ -4,6 +4,12 @@ from typing import Dict, Optional, Tuple
 import torch
 import torch.nn.functional as F
 
+from core.mrsi_physics import (
+    center_pad_native,
+    mrsi_native_forward_batch,
+    native_support_mask_batch,
+)
+
 
 def _hann2d(h: int, w: int, device=None, dtype=None) -> torch.Tensor:
     wy = torch.hann_window(h, periodic=True, device=device, dtype=dtype)
@@ -51,9 +57,11 @@ def dmi_quant_metrics(
     target: torch.Tensor,
     mask: Optional[torch.Tensor] = None,
     *,
+    normalization_scale: float = 1.0,
+    hr_voxel_area: float = 1.0,
     eps: float = 1e-8,
 ) -> Dict[str, float]:
-    """Masked DMI/MRSI quantitative metrics on normalized 2D maps."""
+    """Masked DMI/MRSI metrics in normalized and reversible quantity units."""
     x = _to_01(_as_2d(pred))
     y = _to_01(_as_2d(target))
     m = _as_mask(mask, y)
@@ -76,6 +84,10 @@ def dmi_quant_metrics(
     y_std = y_vals.std(unbiased=False)
     x_sum = (x * mf).sum()
     y_sum = (y * mf).sum()
+    scale = float(normalization_scale)
+    voxel_area = float(hr_voxel_area)
+    x_integral = x_sum * scale * voxel_area
+    y_integral = y_sum * scale * voxel_area
 
     return {
         "masked_psnr": float(masked_psnr.item()),
@@ -86,6 +98,50 @@ def dmi_quant_metrics(
         "roi_std_rel_err": float(((x_std - y_std).abs() / y_std.abs().clamp_min(eps)).item()),
         "roi_sum_abs_err": float((x_sum - y_sum).abs().item()),
         "roi_sum_rel_err": float(((x_sum - y_sum).abs() / y_sum.abs().clamp_min(eps)).item()),
+        "roi_mean_abs_err_quantity": float(((x_mean - y_mean).abs() * scale).item()),
+        "concentration_integral_abs_err": float((x_integral - y_integral).abs().item()),
+        "concentration_integral_rel_err": float(
+            ((x_integral - y_integral).abs() / y_integral.abs().clamp_min(eps)).item()
+        ),
+    }
+
+
+@torch.no_grad()
+def native_acquisition_consistency_2d(
+    pred: torch.Tensor,
+    lr_native: torch.Tensor,
+    lr_matrix: int,
+    mask: Optional[torch.Tensor] = None,
+    *,
+    window: str = "hamming",
+    eps: float = 1e-8,
+) -> Dict[str, float]:
+    """Compare the forward projection of SR with the observed native LR map."""
+    x = _to_01(_as_2d(pred)).unsqueeze(0).unsqueeze(0)
+    target_2d = _as_2d(lr_native).detach().float().clamp(0.0, 1.0)
+    n = int(lr_matrix)
+    if tuple(target_2d.shape) == (n, n):
+        target = center_pad_native(target_2d.unsqueeze(0).unsqueeze(0), tuple(x.shape[-2:]))
+    elif tuple(target_2d.shape) == tuple(x.shape[-2:]):
+        target = target_2d.unsqueeze(0).unsqueeze(0)
+    else:
+        raise ValueError(
+            f"Native LR shape {tuple(target_2d.shape)} must be {(n, n)} or {tuple(x.shape[-2:])}"
+        )
+    predicted_native = mrsi_native_forward_batch(x, [n], window=window)
+    mask_4d = None if mask is None else _as_2d(mask).unsqueeze(0).unsqueeze(0)
+    weights = native_support_mask_batch(mask_4d, [n], reference=predicted_native)
+    denom = weights.sum().clamp_min(1.0)
+    diff = (predicted_native - target) * weights
+    target_abs_mean = (target.abs() * weights).sum() / denom
+    signed_mean = diff.sum() / denom
+    return {
+        "native_acquisition_l1": float((diff.abs().sum() / denom).item()),
+        "native_acquisition_rmse": float(torch.sqrt((diff.square().sum() / denom).clamp_min(0.0)).item()),
+        "native_acquisition_mean_bias": float(signed_mean.item()),
+        "native_acquisition_rel_l1": float(
+            ((diff.abs().sum() / denom) / target_abs_mean.clamp_min(eps)).item()
+        ),
     }
 
 
@@ -311,7 +367,9 @@ def hfen_2d(
         if m.shape != x.shape:
             raise ValueError(f"mask shape {tuple(m.shape)} must match image shape {tuple(x.shape)}")
 
-    kernel = _log_kernel_2d(sigma=sigma, trunc=trunc, device=x.device, dtype=x.dtype).view(1, 1, -1, -1)
+    kernel = _log_kernel_2d(
+        sigma=sigma, trunc=trunc, device=x.device, dtype=x.dtype
+    ).unsqueeze(0).unsqueeze(0)
     pad = kernel.shape[-1] // 2
     x_hp = F.conv2d(x.view(1, 1, *x.shape), kernel, padding=pad).squeeze(0).squeeze(0)
     y_hp = F.conv2d(y.view(1, 1, *y.shape), kernel, padding=pad).squeeze(0).squeeze(0)
@@ -322,5 +380,3 @@ def hfen_2d(
     target_rms = torch.sqrt(((y_hp ** 2) * m_float).sum() / denom).clamp_min(eps)
     nrmse = rmse / target_rms
     return {"hfen_rmse": float(rmse.item()), "hfen_nrmse": float(nrmse.item())}
-
-

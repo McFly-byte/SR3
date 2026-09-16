@@ -1,6 +1,8 @@
 import torch
 import torch.nn.functional as F
 
+from core.mrsi_physics import mrsi_native_forward_batch, native_support_mask_batch
+
 
 def _mask_like(mask, ref):
     if mask is None:
@@ -13,13 +15,18 @@ def masked_l1_sum(pred, target, mask=None):
     return (torch.abs(pred - target) * m).sum()
 
 
-def roi_mean_consistency_sum(pred, target, mask=None, eps=1e-6):
+def roi_mean_consistency_sum(pred, target, mask=None, eps=1e-6, min_scale=0.05):
     m = _mask_like(mask, pred)
     reduce_dims = tuple(range(1, pred.dim()))
     denom = m.sum(dim=reduce_dims).clamp_min(1.0)
     pred_mean = (pred * m).sum(dim=reduce_dims) / denom
     target_mean = (target * m).sum(dim=reduce_dims) / denom
-    rel = torch.abs(pred_mean - target_mean) / target_mean.abs().clamp_min(eps)
+    # A signed ROI mean may be close to zero after [-1, 1] normalization,
+    # making division by |target_mean| numerically explosive. Normalize by
+    # the mean absolute target signal and keep a small physical floor.
+    target_scale = (target.abs() * m).sum(dim=reduce_dims) / denom
+    target_scale = target_scale.clamp_min(max(float(eps), float(min_scale)))
+    rel = torch.abs(pred_mean - target_mean) / target_scale
     return rel.mean() * float(pred.numel())
 
 
@@ -78,3 +85,37 @@ def degradation_l1_sum(pred_x0, lr, lowres_half=None, mask=None, window="hamming
         degraded = _kspace_degrade_batch(pred_01, lowres_half, window=window).clamp(0.0, 1.0)
     m = _mask_like(mask, pred_x0)
     return (torch.abs(degraded - lr_01) * m).sum()
+
+
+def native_acquisition_l1_sum(
+    pred_x0,
+    lr_native,
+    lr_matrix,
+    *,
+    mask=None,
+    valid=None,
+    window="hamming",
+):
+    """Simulator-matched data fidelity on the native acquisition grid.
+
+    ``lr_native`` is center-padded to the HR tensor size by the dataset.  The
+    returned value is scaled like the other ``*_sum`` losses so that the
+    caller's final division by ``pred_x0.numel()`` produces a weighted mean.
+    """
+    pred_01 = ((pred_x0 + 1.0) * 0.5).clamp(0.0, 1.0)
+    target = lr_native.to(device=pred_x0.device, dtype=pred_01.dtype).clamp(0.0, 1.0)
+    degraded = mrsi_native_forward_batch(
+        pred_01,
+        lr_matrix,
+        window=window,
+        clamp_nonnegative=True,
+    )
+    weights = native_support_mask_batch(mask, lr_matrix, reference=degraded)
+    if valid is not None:
+        valid_t = valid.to(device=pred_x0.device, dtype=weights.dtype).reshape(-1, 1, 1, 1)
+        weights = weights * valid_t
+    denom = weights.sum()
+    if float(denom.detach().item()) <= 0.0:
+        return pred_x0.sum() * 0.0
+    mean_l1 = (torch.abs(degraded - target) * weights).sum() / denom.clamp_min(1.0)
+    return mean_l1 * float(pred_x0.numel())

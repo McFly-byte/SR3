@@ -7,7 +7,9 @@ import json
 import torch
 import torch.nn as nn
 import os
+import re
 import model.networks as networks
+from core.mrsi_physics import refine_native_data_consistency
 from .base_model import BaseModel
 logger = logging.getLogger('base')
 
@@ -44,6 +46,14 @@ class DDPM(BaseModel):
         self.step_start_ema = int(ema_cfg.get('step_start_ema', 0) or 0)
         self.update_ema_every = int(ema_cfg.get('update_ema_every', 1) or 1)
         self.ema_decay = float(ema_cfg.get('ema_decay', 0.9999) or 0.9999)
+        self.reset_ema_on_resume = bool(ema_cfg.get('reset_on_resume', False))
+        validation_cfg = opt.get('validation', {}) or {}
+        self.eval_network = str(validation_cfg.get('eval_network', 'auto') or 'auto').lower()
+        if self.eval_network not in ('auto', 'raw', 'ema'):
+            raise ValueError(
+                "validation.eval_network must be one of: auto, raw, ema; "
+                "got {!r}.".format(self.eval_network)
+            )
         if self.use_ema:
             self.netG_EMA = copy.deepcopy(_unwrap_module(self.netG)).to(self.device)
         if self.opt['phase'] == 'train':
@@ -131,10 +141,21 @@ class DDPM(BaseModel):
             self.log_dict[key] = float(value)
         self.log_dict['skipped_step'] = 0.0
         return True
-    def _get_eval_network(self):
-        if self.netG_EMA is not None:
+    def _get_eval_network(self, network=None):
+        choice = str(network or self.eval_network or 'auto').lower()
+        if choice == 'raw':
+            return self.netG
+        if choice == 'ema':
+            if self.netG_EMA is None:
+                raise RuntimeError('EMA evaluation was requested, but EMA is disabled.')
             return self.netG_EMA
-        return self.netG
+        if choice == 'auto':
+            return self.netG_EMA if self.netG_EMA is not None else self.netG
+        raise ValueError("Unknown evaluation network: {!r}".format(choice))
+
+    def get_eval_network_name(self, network=None):
+        selected = self._get_eval_network(network)
+        return 'ema' if selected is self.netG_EMA else 'raw'
 
     def update_ema(self):
         if self.netG_EMA is None:
@@ -148,10 +169,16 @@ class DDPM(BaseModel):
             target_net.load_state_dict(source_state)
             return
         for key, param in source_state.items():
-            target_state[key].mul_(self.ema_decay).add_(param.detach(), alpha=1.0 - self.ema_decay)
+            if torch.is_floating_point(target_state[key]):
+                target_state[key].mul_(self.ema_decay).add_(
+                    param.detach(), alpha=1.0 - self.ema_decay
+                )
+            else:
+                target_state[key].copy_(param.detach())
 
-    def test(self, continous=False, seed=None, sample_num_steps=None):
-        eval_net = self._get_eval_network()
+    def test(self, continous=False, seed=None, sample_num_steps=None, network=None):
+        eval_net = self._get_eval_network(network)
+        raw_was_training = self.netG.training
         eval_net.eval()
         with torch.no_grad():
             if hasattr(eval_net, 'module'):
@@ -160,17 +187,38 @@ class DDPM(BaseModel):
             else:
                 self.SR = eval_net.super_resolution(
                     self.data['SR'], continous, seed=seed, sample_num_steps=sample_num_steps)
-        self.netG.train()
+        dc_opt = (self.opt.get('validation', {}) or {}).get('native_data_consistency', {}) or {}
+        if bool(dc_opt.get('enabled', False)):
+            if continous:
+                raise ValueError('native_data_consistency requires continous=False.')
+            missing = [key for key in ('LR_NATIVE', 'LR_MATRIX') if key not in self.data]
+            if missing:
+                raise KeyError(f"native_data_consistency requires fields: {missing}")
+            self.SR = refine_native_data_consistency(
+                self.SR,
+                self.data['LR_NATIVE'],
+                self.data['LR_MATRIX'],
+                hr_mask=self.data.get('MASK', None),
+                valid=self.data.get('HAS_NATIVE_LR', None),
+                window=dc_opt.get('window', 'hamming'),
+                iterations=int(dc_opt.get('iterations', 10)),
+                learning_rate=float(dc_opt.get('learning_rate', 0.02)),
+                anchor_weight=float(dc_opt.get('anchor_weight', 0.1)),
+            )
+        if raw_was_training:
+            self.netG.train()
 
-    def sample(self, batch_size=1, continous=False, seed=None, sample_num_steps=None):
-        eval_net = self._get_eval_network()
+    def sample(self, batch_size=1, continous=False, seed=None, sample_num_steps=None, network=None):
+        eval_net = self._get_eval_network(network)
+        raw_was_training = self.netG.training
         eval_net.eval()
         with torch.no_grad():
             if hasattr(eval_net, 'module'):
                 self.SR = eval_net.module.sample(batch_size, continous, seed=seed, sample_num_steps=sample_num_steps)
             else:
                 self.SR = eval_net.sample(batch_size, continous, seed=seed, sample_num_steps=sample_num_steps)
-        self.netG.train()
+        if raw_was_training:
+            self.netG.train()
 
     def set_loss(self):
         if hasattr(self.netG, 'module'):
@@ -271,6 +319,10 @@ class DDPM(BaseModel):
                 torch.load(gen_path, map_location=self.device),
                 strict=(not self.opt['model']['finetune_norm'])
             )
+            checkpoint_match = re.search(r'I(\d+)_E(\d+)$', str(load_path).replace('\\', '/'))
+            if checkpoint_match:
+                self.begin_step = int(checkpoint_match.group(1))
+                self.begin_epoch = int(checkpoint_match.group(2))
             ema_path = '{}_ema_gen.pth'.format(load_path)
             if self.netG_EMA is not None and os.path.exists(ema_path):
                 ema_network = _unwrap_module(self.netG_EMA)
@@ -278,12 +330,21 @@ class DDPM(BaseModel):
                     torch.load(ema_path, map_location=self.device),
                     strict=(not self.opt['model']['finetune_norm'])
                 )
+            if self.netG_EMA is not None and self.reset_ema_on_resume and self.opt['phase'] == 'train':
+                ema_network = _unwrap_module(self.netG_EMA)
+                ema_network.load_state_dict(network.state_dict())
+                logger.info('Reset EMA weights from the resumed raw checkpoint.')
             # network.load_state_dict(torch.load(
             #     gen_path), strict=False)
             if self.opt['phase'] == 'train':
                 # optimizer
                 opt = torch.load(opt_path, map_location=self.device)
                 self.optG.load_state_dict(opt['optimizer'])
+                if bool(self.opt.get('train', {}).get('override_optimizer_lr_on_resume', False)):
+                    configured_lr = float(self.opt['train']['optimizer']['lr'])
+                    for group in self.optG.param_groups:
+                        group['lr'] = configured_lr
+                    logger.info('Overrode resumed optimizer learning rate with %.6g.', configured_lr)
                 for state in self.optG.state.values():
                     for k, v in state.items():
                         if torch.is_tensor(v):

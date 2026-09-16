@@ -235,3 +235,6 @@ dataset_mrsi/**/visual_check/
 *.bat
 *.ps1
 
+
+# Local tool binaries / bundled dependencies
+.tools/

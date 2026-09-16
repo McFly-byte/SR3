@@ -82,6 +82,7 @@ def create_dataset(dataset_opt, phase):
             use_flair=dataset_opt.get('use_flair', True),
             use_met_onehot=dataset_opt.get('use_met_onehot', True),
             use_mask_channel=dataset_opt.get('use_mask_channel', False),
+            use_native_lr_consistency=dataset_opt.get('use_native_lr_consistency', False),
             strict_check=dataset_opt.get('strict_check', False),
         )
     else:

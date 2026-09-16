@@ -13,8 +13,10 @@ from .losses import (
     frequency_l1_sum,
     gradient_l1_sum,
     masked_l1_sum,
+    native_acquisition_l1_sum,
     roi_mean_consistency_sum,
 )
+from core.loss_improved import charbonnier_loss, ssim_loss
 
 
 def _warmup_beta(linear_start, linear_end, n_timestep, warmup_frac):
@@ -58,6 +60,26 @@ def make_beta_schedule(schedule, n_timestep, linear_start=1e-4, linear_end=2e-2,
     return betas
 
 
+def make_ddim_timesteps(num_timesteps, ddim_steps):
+    """Return a descending DDIM subsequence including t=T-1 and t=0."""
+    num_timesteps = int(num_timesteps)
+    ddim_steps = int(ddim_steps)
+    if ddim_steps < 1 or ddim_steps > num_timesteps:
+        raise ValueError(
+            'ddim_steps must be in [1, {}], got {}.'.format(
+                num_timesteps, ddim_steps
+            )
+        )
+    if ddim_steps == 1:
+        return [num_timesteps - 1]
+    return torch.linspace(
+        0,
+        num_timesteps - 1,
+        steps=ddim_steps,
+        dtype=torch.float64,
+    ).round().to(torch.long).flip(0).tolist()
+
+
 # gaussian diffusion trainer class
 
 def exists(x):
@@ -92,7 +114,12 @@ class GaussianDiffusion(nn.Module):
         freq_x0_loss_weight=0.0,
         degradation_loss_weight=0.0,
         degradation_window="hamming",
+        acquisition_loss_weight=0.0,
+        acquisition_window="hamming",
         condition_dropout_prob=0.0,
+        min_snr_gamma=0.0,
+        x0_charbonnier_weight=0.0,
+        x0_ssim_weight=0.0,
         condition_layout=None,
         condition_adapter=None,
     ):
@@ -117,7 +144,15 @@ class GaussianDiffusion(nn.Module):
         self.freq_x0_loss_weight = float(freq_x0_loss_weight)
         self.degradation_loss_weight = float(degradation_loss_weight)
         self.degradation_window = degradation_window
+        self.acquisition_loss_weight = float(acquisition_loss_weight)
+        self.acquisition_window = acquisition_window
         self.condition_dropout_prob = float(condition_dropout_prob)
+        # Min-SNR loss weighting (Hang et al., ICCV 2023). A value <= 0 keeps
+        # the original objective exactly unchanged.
+        self.min_snr_gamma = float(min_snr_gamma)
+        # Improved auxiliary x0 losses (default 0 -> old behaviour unchanged).
+        self.x0_charbonnier_weight = float(x0_charbonnier_weight)
+        self.x0_ssim_weight = float(x0_ssim_weight)
         self.condition_layout = condition_layout or {
             "lr": [0, 1],
             "t1": [1, 2],
@@ -308,10 +343,10 @@ class GaussianDiffusion(nn.Module):
         """
         device = self.betas.device
 
-        # Build uniformly-spaced subsequence of timesteps
-        c = max(self.num_timesteps // ddim_steps, 1)
-        # Descending order: T-1, T-1-c, ..., 0
-        timesteps = list(reversed(range(0, self.num_timesteps, c)))[:ddim_steps]
+        # Uniformly cover the complete training trajectory, including both
+        # t=0 and t=T-1. The old range-based schedule started at 950 for a
+        # 20-step/1000-step sampler, creating a train/inference mismatch.
+        timesteps = make_ddim_timesteps(self.num_timesteps, ddim_steps)
 
         generator = None
         if seed is not None:
@@ -504,17 +539,29 @@ class GaussianDiffusion(nn.Module):
                 cond=cond,
             )
 
-        # Mask-weighted pixel loss: ROI pixels receive higher gradient weight
+        # Mask-weighted pixel loss: ROI pixels receive higher gradient weight.
+        elementwise_loss = self.loss_func_elementwise(noise, x_recon)
         mask = x_in.get('MASK', None)
         if mask is not None and self.mask_loss_weight != 1.0:
             # weight in [1, mask_loss_weight]; background=1, ROI=mask_loss_weight
             weight = 1.0 + (self.mask_loss_weight - 1.0) * mask.to(x_start.device)
-            pixel_loss = (self.loss_func_elementwise(noise, x_recon) * weight).sum()
+            elementwise_loss = elementwise_loss * weight
+
+        if self.min_snr_gamma > 0.0:
+            alpha = continuous_sqrt_alpha_cumprod_spatial.square()
+            snr = alpha / (1.0 - alpha).clamp_min(1e-8)
+            # Epsilon-prediction weighting: min(SNR, gamma) / SNR.
+            min_snr_weight = (snr.clamp(max=self.min_snr_gamma) / snr.clamp_min(1e-8)).detach()
+            elementwise_loss = elementwise_loss * min_snr_weight
         else:
-            pixel_loss = self.loss_func(noise, x_recon)
+            min_snr_weight = None
+
+        pixel_loss = elementwise_loss.sum()
 
         loss = pixel_loss
         loss_terms = {"loss/noise": pixel_loss.detach() / float(x_start.numel())}
+        if min_snr_weight is not None:
+            loss_terms["train/min_snr_weight"] = min_snr_weight.detach().mean()
 
         if self.freq_loss_weight > 0.0:
             freq_noise = self._freq_loss(noise, x_recon)
@@ -528,6 +575,9 @@ class GaussianDiffusion(nn.Module):
                 self.grad_loss_weight,
                 self.freq_x0_loss_weight,
                 self.degradation_loss_weight,
+                self.acquisition_loss_weight,
+                self.x0_charbonnier_weight,
+                self.x0_ssim_weight,
             ]
         )
         if needs_x0:
@@ -563,7 +613,39 @@ class GaussianDiffusion(nn.Module):
                 )
                 loss = loss + self.degradation_loss_weight * deg_loss
                 loss_terms["loss/degradation"] = deg_loss.detach() / float(x_start.numel())
+            if self.acquisition_loss_weight > 0.0:
+                missing = [key for key in ('LR_NATIVE', 'LR_MATRIX') if key not in x_in]
+                if missing:
+                    raise KeyError(
+                        "acquisition_loss_weight > 0 requires native LR data; "
+                        f"missing fields: {missing}"
+                    )
+                acquisition_loss = native_acquisition_l1_sum(
+                    x0_hat,
+                    x_in['LR_NATIVE'],
+                    x_in['LR_MATRIX'],
+                    mask=mask,
+                    valid=x_in.get('HAS_NATIVE_LR', None),
+                    window=self.acquisition_window,
+                )
+                loss = loss + self.acquisition_loss_weight * acquisition_loss
+                loss_terms["loss/acquisition_native"] = (
+                    acquisition_loss.detach() / float(x_start.numel())
+                )
 
+            # ---- improved auxiliary x0 losses (all default 0) ----
+            if self.x0_charbonnier_weight > 0.0:
+                pred01 = x0_hat.clamp(-1, 1) * 0.5 + 0.5
+                tgt01 = x_start.clamp(-1, 1) * 0.5 + 0.5
+                x0_charb = charbonnier_loss(pred01, tgt01, mask=mask)
+                loss = loss + self.x0_charbonnier_weight * x0_charb * float(x_start.numel())
+                loss_terms["loss/x0_charbonnier"] = x0_charb.detach()
+            if self.x0_ssim_weight > 0.0:
+                pred01 = x0_hat.clamp(-1, 1) * 0.5 + 0.5
+                tgt01 = x_start.clamp(-1, 1) * 0.5 + 0.5
+                x0_ssim = ssim_loss(pred01, tgt01, mask=mask)
+                loss = loss + self.x0_ssim_weight * x0_ssim * float(x_start.numel())
+                loss_terms["loss/x0_ssim"] = x0_ssim.detach()
         self.last_loss_dict = {
             key: float(val.item() if torch.is_tensor(val) else val)
             for key, val in loss_terms.items()

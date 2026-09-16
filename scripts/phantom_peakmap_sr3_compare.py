@@ -10,7 +10,7 @@
 
 原因简述
 --------
-- ``peak_area_map.csv`` 可直接作为「空间峰面积图」喂给网络做 **推理演示**（经 min-max 与插值到模型尺寸）。
+- ``peak_area_map.csv`` 只有在提供固定、可复用的定量尺度后才可送入网络；脚本不再逐图 min-max。
 - Scan 27 的 12×12 与 Scan 26 的 8×8 为 **不同扫描/不同 CSI 矩阵**，体素划分与 FOV 未必一致，
   **不能**把 27 的图当作 26 的 HR 真值做定量对比。
 
@@ -23,7 +23,7 @@
     python scripts/phantom_peakmap_sr3_compare.py \\
         --lr_csv \"D:/.../scan_26_8x8_spatial_ifft_peak_area_map.csv\" \\
         --hr_csv \"D:/path/to/paired_hr.csv\" \\
-        --run_dir experiments/sr3_mrsi_64_mvp_260428_231833 \\
+        --run_dir experiments/models/healthy_phantom_i300000_ema \\
         --config config/sr3_mrsi_64_mvp.json \\
         --output graph/phantom_compare.png
 
@@ -31,7 +31,7 @@
     python scripts/phantom_peakmap_sr3_compare.py \\
         --lr_csv \"D:/.../scan_26_8x8_spatial_ifft_peak_area_map.csv\" \\
         --ref_bicubic \\
-        --run_dir experiments/sr3_mrsi_64_mvp_260428_231833 \\
+        --run_dir experiments/models/healthy_phantom_i300000_ema \\
         --config config/sr3_mrsi_64_mvp.json \\
         --output graph/phantom_lr_sr_bicubic.png
 """
@@ -124,6 +124,12 @@ def main() -> None:
     parser.add_argument("--config", type=str, required=True)
     parser.add_argument("--checkpoint_prefix", type=str, default=None)
     parser.add_argument("--output", type=str, default="phantom_peakmap_compare.png")
+    parser.add_argument("--normalization_contract", type=str, default=None)
+    parser.add_argument("--metabolite", choices=("HDO", "Glc", "Glx", "Lac"), default="HDO")
+    parser.add_argument("--normalization_scale", type=float, default=None)
+    parser.add_argument("--input_normalized", action="store_true")
+    parser.add_argument("--quantity_unit", type=str, default=None)
+    parser.add_argument("--numeric_output", type=str, default=None)
     parser.add_argument("--gpu_ids", type=str, default="0")
     parser.add_argument("--cpu", action="store_true")
     parser.add_argument("--seed", type=int, default=0)
@@ -200,7 +206,33 @@ def main() -> None:
     diffusion.set_new_noise_schedule(opt["model"]["beta_schedule"]["val"], schedule_phase="val")
     dev = diffusion.device
 
-    batch = ibc._batch_from_lr_hr_numpy(lr_np, hr_for_model, image_size, dev, val_ds)
+    contract = ibc.load_normalization_contract(args.normalization_contract) if args.normalization_contract else None
+    scale = args.normalization_scale
+    if scale is None and contract is not None:
+        scale = contract["normalization_scales"][args.metabolite]
+    if scale is None:
+        if args.input_normalized:
+            scale = 1.0
+        else:
+            raise SystemExit(
+                "定量 CSV 禁止逐图 min-max。请提供固定 --normalization_scale（实测峰面积通常需先做标定），"
+                "或对已归一化数据显式加 --input_normalized。"
+            )
+    quantity_unit = args.quantity_unit
+    if quantity_unit is None and contract is not None:
+        quantity_unit = contract["quantity_unit"]
+    quantity_unit = quantity_unit or "quantity_unit"
+    batch = ibc._batch_from_lr_hr_numpy(
+        lr_np,
+        hr_for_model,
+        image_size,
+        dev,
+        val_ds,
+        normalization_scale=float(scale),
+        input_normalized=bool(args.input_normalized),
+        quantity_unit=quantity_unit,
+        met_id=ibc._MET_TO_ID[args.metabolite],
+    )
     diffusion.feed_data(batch)
     diffusion.test(continous=False, seed=int(args.seed), sample_num_steps=sample_num_steps)
     visuals = diffusion.get_current_visuals(need_LR=True)
@@ -209,7 +241,9 @@ def main() -> None:
     if sr_t.dim() == 4 and sr_t.shape[0] > 1:
         sr_t = sr_t[-1:]
 
-    lr01_small = ibc._norm_minmax_01(lr_np)
+    lr01_small = ibc._as_normalized_01(
+        lr_np, scale=float(scale), input_normalized=bool(args.input_normalized)
+    )
     lr_plot = _up01_nearest(lr01_small, image_size)
     sr_plot = ibc._tensor01_for_plot(sr_t)
 
@@ -228,17 +262,39 @@ def main() -> None:
     title = " | ".join(title_parts)
 
     out_path = Path(args.output)
+    lr_quantity = ibc.denormalize_quantity(lr_plot, float(scale))
+    sr_quantity = ibc.denormalize_quantity(sr_plot, float(scale))
+    ref_quantity = ibc.denormalize_quantity(hr_plot, float(scale))
     ibc._save_triplet_figure(
-        lr_plot,
-        sr_plot,
-        hr_plot,
+        lr_quantity,
+        sr_quantity,
+        ref_quantity,
         out_path,
         title=title,
         cmap=args.cmap,
         dpi=args.dpi,
         panel_labels=labels,
+        colorbar_label=quantity_unit,
+    )
+    numeric_path = (
+        Path(args.numeric_output)
+        if args.numeric_output
+        else out_path.with_name(f"{out_path.stem}_quantitative.npz")
+    )
+    numeric_path.parent.mkdir(parents=True, exist_ok=True)
+    np.savez_compressed(
+        numeric_path,
+        lr_quantity=lr_quantity.astype(np.float32),
+        sr_quantity=sr_quantity.astype(np.float32),
+        reference_quantity=ref_quantity.astype(np.float32),
+        normalization_scale=np.float32(scale),
+        quantity_unit=np.array(quantity_unit),
+        voxel_semantics=np.array("intensive"),
+        reference_is_hr=np.bool_(hr_np is not None),
+        checkpoint_prefix=np.array(str(resume_prefix)),
     )
     log.info("已保存: %s", out_path.resolve())
+    log.info("已保存浮点定量结果: %s", numeric_path.resolve())
 
 
 if __name__ == "__main__":

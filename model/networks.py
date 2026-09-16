@@ -162,16 +162,24 @@ def define_G(opt):
         freq_x0_loss_weight=model_opt['diffusion'].get('freq_x0_loss_weight', 0.0),
         degradation_loss_weight=model_opt['diffusion'].get('degradation_loss_weight', 0.0),
         degradation_window=model_opt['diffusion'].get('degradation_window', 'hamming'),
+        acquisition_loss_weight=model_opt['diffusion'].get('acquisition_loss_weight', 0.0),
+        acquisition_window=model_opt['diffusion'].get('acquisition_window', 'hamming'),
         condition_dropout_prob=model_opt['diffusion'].get('condition_dropout_prob', 0.0),
+        min_snr_gamma=model_opt['diffusion'].get('min_snr_gamma', 0.0),
+        x0_charbonnier_weight=model_opt['diffusion'].get('x0_charbonnier_weight', 0.0),
+        x0_ssim_weight=model_opt['diffusion'].get('x0_ssim_weight', 0.0),
         condition_layout=condition_layout,
         condition_adapter=condition_adapter,
     )
-    if opt['phase'] == 'train':
+    resume_state = (opt.get('path', {}) or {}).get('resume_state')
+    if opt['phase'] == 'train' and not resume_state:
         # init_weights(netG, init_type='kaiming', scale=0.1)
         init_weights(netG, init_type='orthogonal')
         denoise_fn = netG.denoise_fn.module if hasattr(netG.denoise_fn, 'module') else netG.denoise_fn
         if hasattr(denoise_fn, 'reset_condition_branch_parameters'):
             denoise_fn.reset_condition_branch_parameters()
+    elif opt['phase'] == 'train':
+        logger.info('Skipping random weight initialization because resume_state is set.')
     if opt.get('gpu_ids') and opt.get('distributed'):
         assert torch.cuda.is_available()
         local_rank = int(opt.get('local_rank', 0))

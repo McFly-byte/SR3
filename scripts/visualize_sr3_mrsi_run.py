@@ -30,6 +30,20 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import matplotlib.pyplot as plt
 import numpy as np
+from mpl_toolkits.axes_grid1.inset_locator import inset_axes
+
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+
+from core.dmi_visualization import (  # noqa: E402
+    DEFAULT_PERCENTILES,
+    DEFAULT_ROTATE_K,
+    orient_for_display,
+    robust_display_limits,
+    signed_error_limit,
+    validate_percentiles,
+)
 
 try:
     from PIL import Image
@@ -40,8 +54,10 @@ except ImportError as e:
 # 支持的扩展名（小写，含点）
 _EXTENSIONS = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff", ".npy"}
 
-# 匹配 stem：公共前缀 + _lr / _sr / _hr（不区分大小写）
-_TRIPLET_STEM_RE = re.compile(r"^(?P<base>.+)_(?P<kind>lr|sr|hr)$", re.IGNORECASE)
+# 匹配 stem：公共前缀 + _lr / _sr / _sr_0 / _hr（不区分大小写）
+_TRIPLET_STEM_RE = re.compile(
+    r"^(?P<base>.+)_(?P<kind>lr|sr(?:_\d+)?|hr)$", re.IGNORECASE
+)
 
 # sr.py 写入的验证指标：{iter}_metrics.json
 _METRICS_STEM_RE = re.compile(r"^(?P<iter>\d+)_metrics$", re.IGNORECASE)
@@ -93,15 +109,38 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument(
         "--cmap",
         type=str,
-        default="turbo",
-        help="matplotlib 色图名称（默认: turbo）。不可使用 gray/grey 等灰度色图。",
+        default="viridis",
+        help="代谢图色图（默认: viridis，与 simulated_with_lesion 一致）。",
     )
     p.add_argument(
         "--norm_mode",
         type=str,
-        choices=("per_triplet", "global"),
-        default="per_triplet",
-        help="归一化: per_triplet=每组 lr/sr/hr 联合 min-max; global=所有选中样本联合 min-max。",
+        choices=("robust_per_triplet", "per_triplet", "global"),
+        default="robust_per_triplet",
+        help=(
+            "显示窗: robust_per_triplet=按 HR 估计脑区后联合百分位截断（默认）；"
+            "per_triplet/global 保留旧的极值窗。"
+        ),
+    )
+    p.add_argument(
+        "--percentiles",
+        type=float,
+        nargs=2,
+        metavar=("LOW", "HIGH"),
+        default=DEFAULT_PERCENTILES,
+        help="稳健显示窗百分位（默认: 1 99）。",
+    )
+    p.add_argument(
+        "--rotate_k",
+        type=int,
+        choices=(0, 1, 2, 3),
+        default=DEFAULT_ROTATE_K,
+        help="逆时针旋转 90 度的次数（默认: 1，与仿真预览一致）。",
+    )
+    p.add_argument(
+        "--no_error",
+        action="store_true",
+        help="不显示 SR-HR 有符号误差列；默认显示并使用 coolwarm 对称色标。",
     )
     p.add_argument(
         "--dpi",
@@ -114,10 +153,19 @@ def _parse_args() -> argparse.Namespace:
         action="store_true",
         help="与 --iter 联用：若在全树递归后仍未找到文件，再只扫描 run_dir 顶层目录。",
     )
-    p.add_argument(
+    colorbar_group = p.add_mutually_exclusive_group()
+    colorbar_group.add_argument(
         "--colorbar",
+        dest="colorbar",
         action="store_true",
-        help="为每个子图显示 colorbar（默认关闭以保持紧凑）。",
+        default=True,
+        help="显示 colorbar（默认开启；LR/SR/HR 共用一个，误差图单独一个）。",
+    )
+    colorbar_group.add_argument(
+        "--no_colorbar",
+        dest="colorbar",
+        action="store_false",
+        help="隐藏 colorbar。",
     )
     p.add_argument(
         "--fig_width",
@@ -395,12 +443,15 @@ def _resolve_iter_and_files(
 
 
 def _stem_kind(path: Path) -> Optional[Tuple[str, str]]:
-    """若文件名符合 <base>_(lr|sr|hr)，返回 (base, kind)；否则 None。"""
+    """若文件名符合 <base>_(lr|sr|sr_0|hr)，返回 (base, kind)。"""
     stem = path.stem
     m = _TRIPLET_STEM_RE.match(stem)
     if not m:
         return None
-    return m.group("base"), m.group("kind").lower()
+    kind = m.group("kind").lower()
+    if kind.startswith("sr_"):
+        kind = "sr"
+    return m.group("base"), kind
 
 
 def _group_triplets(paths: List[Path]) -> Dict[str, Dict[str, Path]]:
@@ -478,7 +529,12 @@ def _load_image(path: Path) -> np.ndarray:
         arr = np.asarray(im)
     except Exception as e:
         raise RuntimeError(f"无法读取图像: {path}") from e
-    return _to_2d_float(arr, path)
+    plane = _to_2d_float(arr, path)
+    if np.issubdtype(arr.dtype, np.integer) and not np.issubdtype(arr.dtype, np.bool_):
+        dtype_max = float(np.iinfo(arr.dtype).max)
+        if dtype_max > 1.0:
+            plane = plane / dtype_max
+    return plane
 
 
 def _load_triplet(
@@ -516,8 +572,21 @@ def _per_triplet_vmin_vmax(
     return vmin, vmax
 
 
+def _add_inset_colorbar(fig, ax, image, label: str) -> None:
+    """Place a compact colorbar in the empty corner of a map panel."""
+    color_axis = inset_axes(ax, width="4%", height="58%", loc="lower right", borderpad=0.7)
+    colorbar = fig.colorbar(image, cax=color_axis)
+    colorbar.ax.tick_params(labelsize=6, length=2, pad=1)
+    colorbar.ax.set_title(label, fontsize=6, pad=2)
+
+
 def main() -> None:
     args = _parse_args()
+    try:
+        display_percentiles = validate_percentiles(args.percentiles)
+    except ValueError as exc:
+        print(f"错误: {exc}", file=sys.stderr)
+        sys.exit(2)
     cmap_name = args.cmap.strip()
     if cmap_name.lower() in {x.lower() for x in _GRAY_NAMES}:
         print(
@@ -612,17 +681,19 @@ def main() -> None:
     )
 
     n_rows = len(loaded)
-    n_cols = 3
+    include_error = not args.no_error
+    n_cols = 4 if include_error else 3
     fig_w = float(args.fig_width)
-    # 与 subplots_adjust 一致；先定边距再算 fig_h，使每个子图格接近正方形。
-    # 否则宽扁格子 + imshow 默认 aspect=equal 会在左右留大量空白，看起来像列间距过大。
-    if args.colorbar:
-        _L, _R, _T, _B = 0.002, 0.90, 0.92, 0.002
-    else:
-        _L, _R, _T, _B = 0.002, 0.998, 0.92, 0.002
-    _aw, _ah = _R - _L, _T - _B
-    fig_h = fig_w * (_aw / max(_ah, 1e-6)) * (n_rows / float(n_cols)) * 1.02
+    # 按面板宽度计算正方形单元，再只保留固定物理高度的标题区。
+    # 固定百分比 top 会在 8 行以上的长图中产生很大的顶部空白。
+    # Colorbars are inset in HR/error panels, so they require no outer margin.
+    _L, _R, _B = 0.002, 0.998, 0.002
+    _aw = _R - _L
+    panel_size = fig_w * _aw / float(n_cols)
+    title_height = 0.62
+    fig_h = panel_size * n_rows + title_height
     fig_h = max(2.0, fig_h)
+    _T = 1.0 - title_height / fig_h
     fig, axes = plt.subplots(
         n_rows,
         n_cols,
@@ -642,7 +713,11 @@ def main() -> None:
     )
 
     for r, (_, lr, sr, hr) in enumerate(loaded):
-        if args.norm_mode == "per_triplet":
+        if args.norm_mode == "robust_per_triplet":
+            vmin, vmax = robust_display_limits(
+                (lr, sr, hr), reference=hr, percentiles=display_percentiles
+            )
+        elif args.norm_mode == "per_triplet":
             vmin, vmax = _per_triplet_vmin_vmax(lr, sr, hr)
         else:
             vmin, vmax = g_vmin, g_vmax  # type: ignore
@@ -650,12 +725,45 @@ def main() -> None:
         panels = (lr, sr, hr)
         for c, data in enumerate(panels):
             ax = axes[r, c]
-            im = ax.imshow(data, cmap=cmap, vmin=vmin, vmax=vmax, interpolation="nearest")
+            im = ax.imshow(
+                orient_for_display(data, args.rotate_k),
+                cmap=cmap,
+                vmin=vmin,
+                vmax=vmax,
+                interpolation="nearest",
+            )
             ax.set_axis_off()
-            if args.colorbar:
-                plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+            if r == 0:
+                ax.set_title(("LR input", "SR output", "HR target")[c], fontsize=10)
+        if args.colorbar:
+            _add_inset_colorbar(fig, axes[r, 2], im, "value")
 
-    fig.suptitle(header_text, fontsize=9, y=0.995, va="top")
+        if include_error:
+            difference = sr - hr
+            dlim = signed_error_limit(
+                difference, reference=hr, percentile=display_percentiles[1]
+            )
+            error_ax = axes[r, 3]
+            error_im = error_ax.imshow(
+                orient_for_display(difference, args.rotate_k),
+                cmap="coolwarm",
+                vmin=-dlim,
+                vmax=dlim,
+                interpolation="nearest",
+            )
+            error_ax.set_axis_off()
+            if r == 0:
+                error_ax.set_title("SR - HR", fontsize=10)
+            if args.colorbar:
+                _add_inset_colorbar(fig, error_ax, error_im, "error")
+
+    display_note = (
+        f"viridis | brain-aware {display_percentiles[0]:g}--"
+        f"{display_percentiles[1]:g}% shared scale | rot90"
+        if args.norm_mode == "robust_per_triplet"
+        else f"{cmap_name} | {args.norm_mode} | rot90 x{args.rotate_k}"
+    )
+    fig.suptitle(f"{header_text}\n{display_note}", fontsize=9, y=0.997, va="top")
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(out_path, dpi=args.dpi, bbox_inches="tight", pad_inches=0.08)
