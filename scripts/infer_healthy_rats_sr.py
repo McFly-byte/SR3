@@ -467,8 +467,25 @@ def _forward_residual(sr_img, native, native_mask, window="hamming"):
 
 
 # ── Plotting ─────────────────────────────────────────────────────────────────
+def _sr_panel_label(n_seeds: int, dc_enabled: bool, seed: int, sample_steps: int) -> str:
+    """Build an accurate SR panel title reflecting the actual inference method.
+
+    - Single seed, no DC  -> original label "SR (EMA, seed0, DDIM50)"
+    - Multi-seed avg       -> "SR (EMA, N-seed avg, DDIM50)"
+    - DC enabled           -> append " + DC"
+    """
+    if int(n_seeds) > 1:
+        seed_part = f"{int(n_seeds)}-seed avg"
+    else:
+        seed_part = f"seed{int(seed)}"
+    label = f"SR (EMA, {seed_part}, DDIM{int(sample_steps)})"
+    if bool(dc_enabled):
+        label += " + DC"
+    return label
+
+
 def _plot_comparison(rat_id, scan_num, slice_idx, metabolite, native_au, scale,
-                     t2_64, lr64, sr, residual_native, output):
+                     t2_64, lr64, sr, residual_native, output, *, sr_label: str = "SR (EMA, seed0, DDIM50)"):
     lr_au = lr64 * scale; sr_au = sr * scale
     native64 = _resize_2d(native_au, 64, "nearest")
     vmax = max(float(np.percentile(np.concatenate([native64.ravel(), lr_au.ravel(), sr_au.ravel()]), 99.5)), 1e-8)
@@ -480,7 +497,7 @@ def _plot_comparison(rat_id, scan_num, slice_idx, metabolite, native_au, scale,
         (t2_64, "T2 anatomy", "gray", 0, 1),
         (native64, f"native {native_au.shape[0]}x{native_au.shape[1]}", "turbo", 0, vmax),
         (lr_au, "bicubic LR 64x64", "turbo", 0, vmax),
-        (sr_au, "SR (EMA, seed0, DDIM50)", "turbo", 0, vmax),
+        (sr_au, sr_label, "turbo", 0, vmax),
         (res64, "forward residual", "coolwarm", -rlim, rlim),
         (diff, "SR - bicubic", "coolwarm", -dlim, dlim),
     ]
@@ -668,6 +685,7 @@ def process_scan(scan: ScanData, diffusion, ds_opt, sample_steps: int, seed: int
             _plot_comparison(
                 rat, sn, slice_idx, metabolite, native_au, scale, t2_64, lr64, sr, residual,
                 scan_dir / f"{stem}_comparison.png",
+                sr_label=_sr_panel_label(n_seeds, dc_enabled, seed, sample_steps),
             )
             logger.info("%s scan%d slice%d %s: bicubic_relL1=%.4f sr_relL1=%.4f grad_ratio=%.2f",
                         rat, sn, slice_idx, metabolite,
